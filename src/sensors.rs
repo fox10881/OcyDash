@@ -273,9 +273,10 @@ impl SensorFeed {
     }
 
     fn spawn(&mut self) {
-        let Some(exe) = helper_candidates().into_iter().find(|p| p.exists())
-        else {
-            slog(&format!("{HELPER_EXE} not found (bundled or vendor)"));
+        let Some(exe) = helper_path() else {
+            slog(&format!(
+                "{HELPER_EXE} not found in any layout (bundled/dev/vendor)"
+            ));
             return;
         };
         let dir = exe
@@ -603,20 +604,19 @@ fn slog(msg: &str) {
     }
 }
 
-/// Where the helper can live, most-likely first: the bundled copy
-/// installed beside ocydash.exe (`<exe>\SystemInfos\SystemInfos.exe`
-/// + HWiNFO64.dll — resolved relative to the running exe, never a
-/// hardcoded install path), then the vendor's own install for dev
-/// machines that have the official package.
-fn helper_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            out.push(dir.join("SystemInfos").join(HELPER_EXE));
-        }
-    }
-    out.push(PathBuf::from(HELPER_DIR).join(HELPER_EXE));
-    out
+/// First existing SystemInfos.exe across all layouts: `<exe>\SystemInfos\`
+/// (installed) → `vendor\SystemInfos\` or a workspace `resources\` SDK
+/// tree relative to any ancestor (dev) → the vendor's own install dir.
+fn helper_path() -> Option<PathBuf> {
+    crate::deps::resolve(&[
+        r"SystemInfos\SystemInfos.exe",
+        r"vendor\SystemInfos\SystemInfos.exe",
+        r"resources\main\SDK\VC#\SystemInfos\vs2008\bin\x64\Release\SystemInfos.exe",
+    ])
+    .or_else(|| {
+        let p = PathBuf::from(HELPER_DIR).join(HELPER_EXE);
+        p.exists().then_some(p)
+    })
 }
 
 /// Kill every SystemInfos.exe — any survivor is a stale writer or a

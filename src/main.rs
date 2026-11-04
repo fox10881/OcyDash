@@ -19,6 +19,7 @@
 
 mod app;
 mod background;
+mod deps;
 mod display;
 mod headless;
 mod icon;

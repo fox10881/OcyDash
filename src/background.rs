@@ -18,21 +18,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// ffmpeg for video / large-GIF streaming. Prefer a bundled copy next to
-/// the exe (installed by the OcyDash installer), fall back to the vendor
-/// app's copy for dev machines that still have it installed.
+/// ffmpeg for video / large-GIF streaming. Resolution order:
+/// `<exe>\ffmpeg.exe` (installed layout) → `vendor\ffmpeg\ffmpeg.exe`
+/// relative to any ancestor (dev workspace) → the vendor app's copy.
 fn ffmpeg_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled = dir.join("ffmpeg.exe");
-            if bundled.exists() {
-                return bundled;
-            }
-        }
-    }
-    PathBuf::from(
-        r"C:\Program Files\Ocypus Display\resources\app.asar.unpacked\node_modules\@ffmpeg-installer\win32-x64\ffmpeg.exe",
-    )
+    crate::deps::resolve(&["ffmpeg.exe", r"vendor\ffmpeg\ffmpeg.exe"])
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                r"C:\Program Files\Ocypus Display\resources\app.asar.unpacked\node_modules\@ffmpeg-installer\win32-x64\ffmpeg.exe",
+            )
+        })
 }
 /// cap video ring buffer
 const VIDEO_RING: usize = 8;

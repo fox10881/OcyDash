@@ -51,10 +51,13 @@ Official app spawns `resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
 admin token with no UAC; the powershell `Start-Process` fallback remains
 for non-elevated edge cases.
 
-Helper resolution (`helper_candidates`): bundled `<exe>\SystemInfos\
-SystemInfos.exe` first (installed by the NSIS script from
-`vendor/SystemInfos/` — exe + HWiNFO64.dll, resolved relative to
-current_exe, never a hardcoded path), then the vendor install dir.
+Helper/ffmpeg resolution (`src/deps.rs` `resolve(rels)`): tries every
+candidate against the exe dir first (production layout), then each
+ancestor upward (dev layout — `target\release` walks up to the
+workspace root so `vendor\ffmpeg\ffmpeg.exe`,
+`vendor\SystemInfos\SystemInfos.exe`, and a workspace `resources\` SDK
+tree all resolve). Final fallbacks: official `HELPER_DIR` for the
+sensor helper, the vendor app's asar ffmpeg for video.
 Spawn pins `current_dir` to the helper's own folder and forces
 `TEMP`/`TMP` = `user_temp()` (USERPROFILE\AppData\Local\Temp) so the
 bin lands exactly where `bin_path`/`bin_candidates` read — immune to
