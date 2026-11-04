@@ -26,8 +26,6 @@ const HELPER_EXE: &str = "SystemInfos.exe";
 const OUR_NAME: &str = "OcypusRust";
 /// Respawn the helper if no content change for this long.
 const STALE_AFTER: Duration = Duration::from_secs(10);
-/// Never attempt more than one spawn per this interval (UAC storms are bad).
-const SPAWN_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default, Clone)]
 pub struct SysSample {
@@ -198,7 +196,9 @@ pub struct SensorFeed {
     last_hash: u64,
     last_sample: SysSample,
     last_change: Instant,
-    last_spawn: Option<Instant>,
+    /// the helper is spawned at most once per process lifetime —
+    /// every retry is another UAC prompt (users saw one every ~60s)
+    spawned: bool,
     child: Option<Child>,
 }
 
@@ -209,19 +209,15 @@ impl SensorFeed {
             last_hash: 0,
             last_sample: SysSample::default(),
             last_change: Instant::now(),
-            last_spawn: None,
+            spawned: false,
             child: None,
         }
     }
 
     /// Pick the best live feed (prefer our own writer, else any other
-    /// live Ocypus*.bin writer), spawning the helper only if nothing lives.
+    /// live Ocypus*.bin writer), spawning the helper exactly once when
+    /// nothing lives — stale feeds later only rescan bins, never respawn.
     pub fn ensure(&mut self) {
-        if let Some(t) = self.last_spawn {
-            if t.elapsed() < SPAWN_BACKOFF {
-                return;
-            }
-        }
         for p in bin_candidates() {
             if bin_alive(&p) {
                 eprintln!("[sensors] live feed: {}", p.display());
@@ -230,12 +226,14 @@ impl SensorFeed {
                 return;
             }
         }
-        eprintln!("[sensors] no live feed found — requesting elevated helper");
-        self.spawn();
+        if !self.spawned {
+            eprintln!("[sensors] no live feed found — requesting elevated helper");
+            self.spawn();
+        }
     }
 
     fn spawn(&mut self) {
-        self.last_spawn = Some(Instant::now());
+        self.spawned = true; // one attempt per process, success or not
         let exe = PathBuf::from(HELPER_DIR).join(HELPER_EXE);
         match Command::new(&exe)
             .args([OUR_NAME, "1800", "0"])

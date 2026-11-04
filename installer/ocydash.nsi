@@ -81,11 +81,12 @@ Section "Uninstall"
     Pop $0
     Pop $1
 
-    ; remove the autostart entry only if it points at this install
-    ReadRegStr $0 HKCU "${APP_RUNKEY}" "OcyDash"
-    ${If} $0 == '"$INSTDIR\${APP_EXE}"'
-        DeleteRegValue HKCU "${APP_RUNKEY}" "OcyDash"
-    ${EndIf}
+    ; remove autostart — Task Scheduler task (elevated apps can't use
+    ; the Run key) plus the legacy HKCU value from earlier builds
+    nsExec::ExecToStack 'schtasks /delete /tn "OcyDash" /f'
+    Pop $0
+    Pop $1
+    DeleteRegValue HKCU "${APP_RUNKEY}" "OcyDash"
 
     Delete "$DESKTOP\OcyDash.lnk"
     RMDir /r "$SMPROGRAMS\OcyDash"

@@ -7,6 +7,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=assets/ocydash.rc");
     println!("cargo:rerun-if-changed=assets/ocydash.ico");
+    println!("cargo:rerun-if-changed=assets/ocydash.manifest");
 
     if which_on_path("rc.exe").is_none() {
         if let Some(dir) = sdk_rc_dir() {

@@ -45,8 +45,13 @@ Official app spawns `resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
 `cpuLayout.temperature_list[]` → `CPU (Tctl/Tdie)`, `CPU Die (average)`,
 `CPU CCD1 (Tdie)`; `systemTime` field advances ≈ every 1-2s → aliveness test.
 `SystemInfos.exe` requires elevation (manifest) and is driver-protected
-(can't be killed non-admin) → driver reuses live writers, spawns via
-`Start-Process` (auto-UAC) only when stale.
+(can't be killed non-admin). `ocydash.exe` itself embeds
+`requireAdministrator` (`assets/ocydash.manifest` → `1 24` in
+`assets/ocydash.rc`), so the direct `Command::new` spawn inherits the
+admin token with no UAC; the powershell `Start-Process` fallback remains
+for non-elevated edge cases. The helper is spawned **exactly once per
+process** (`SensorFeed.spawned`) — stale feeds only rescan existing
+writers, never respawn (respawning = UAC spam at every retry).
 
 ## Build / run
 
@@ -80,7 +85,7 @@ ocydash.exe --editor (~95MB RSS while open)
 - `src/main.rs`      mode dispatch (--editor → eframe, else headless)
 - `src/app.rs`       editor UI (Option<EngineHandle> — None in editor mode),
   top bar: themes/save/new/open-folder/rotate + right-aligned
-  "Run on startup" checkbox (cached HKCU state, not polled)
+  "Run on startup" checkbox (cached task state, not polled)
 - `src/theme.rs`     Theme/Widget/Background model + JSON save/load +
   last_theme_path()/write_last_theme() in %APPDATA%\ocydash\themes\
   (one-time migrate of the old %APPDATA%\ocypus-display dir).
@@ -92,11 +97,14 @@ ocydash.exe --editor (~95MB RSS while open)
   Widget.sensor_idx: 0 = auto heuristic, n>0 = list entry n-1 —
   resolved via SysSample::override_value(); the Inspector shows a
   ComboBox for any WidgetKind::sensor_cat() != None.
-- `src/startup.rs`   HKCU\...\CurrentVersion\Run\OcyDash → quoted exe path,
-  no args (autostart = headless service, never the editor)
+- `src/startup.rs`   Task Scheduler logon task `OcyDash` (schtasks /create
+  /sc onlogon /rl highest) — the ONLY silent autostart for an elevated app;
+  Windows ignores HKCU Run entries that would trigger UAC. Legacy Run
+  value is cleaned up on toggle; uninstaller deletes the task.
 - `src/icon.rs`      shared green-disc artwork (tray, window icon, .ico)
-- `build.rs`         embed-resource → assets/ocydash.rc embeds the app icon +
-  VERSIONINFO; auto-finds Windows SDK rc.exe if off PATH
+- `build.rs`         embed-resource → assets/ocydash.rc embeds the app icon,
+  VERSIONINFO + requireAdministrator manifest (assets/ocydash.manifest);
+  auto-finds Windows SDK rc.exe if off PATH
 - `installer/ocydash.nsi`  NSIS → dist/OcyDash-Setup-<ver>.exe; installs to
   %ProgramFiles%\OcyDash, Start Menu (OcyDash + OcyDash Editor + Uninstall)
   + Desktop shortcuts, Add/Remove entry, removes the Run key on uninstall

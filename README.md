@@ -55,7 +55,9 @@ OcyDash is built as a **dual-mode architecture**:
 - **Full Arabic Language Support** — proper RTL shaping, contextual letter
   forms and ligatures via `cosmic-text`. Type Arabic into any custom-text
   widget.
-- **Run on Startup** — one checkbox registers the tray service with Windows.
+- **Run on Startup** — one checkbox registers a highest-privilege Task
+  Scheduler logon task, so the elevated tray service starts silently with
+  Windows — no UAC prompt at boot.
 - **Crash-safe children** — spawned helpers (ffmpeg, sensor feed) are bound
   to a kill-on-close job object, so nothing is ever left running.
 
@@ -73,9 +75,12 @@ OcyDash is built as a **dual-mode architecture**:
 5. In the editor's top bar, tick **Run on startup** to auto-start the tray
    service at logon.
 
-> **Requirements:** Windows 10/11 x64. The sensor feed uses the vendor's
-> `SystemInfos.exe` helper for HWiNFO data — keep the official package's SDK
-> components installed, or any `Ocypus*.bin` writer works.
+> **Requirements:** Windows 10/11 x64, **administrator rights** — OcyDash
+> embeds a `requireAdministrator` manifest so it can orchestrate the
+> vendor's elevated `SystemInfos.exe` sensor helper without repeated UAC
+> prompts (one consent at launch; the startup task bypasses it at logon).
+> Keep the official package's SDK components installed for the HWiNFO feed,
+> or any `Ocypus*.bin` writer works.
 
 ## Build from Source
 
