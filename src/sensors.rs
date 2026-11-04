@@ -239,7 +239,7 @@ impl SensorFeed {
     pub fn ensure(&mut self) {
         for p in bin_candidates() {
             if bin_alive(&p) {
-                eprintln!("[sensors] live feed: {}", p.display());
+                slog(&format!("live feed: {}", p.display()));
                 self.bin_path = p;
                 self.last_change = Instant::now();
                 self.alive = true;
@@ -262,7 +262,7 @@ impl SensorFeed {
             return;
         }
         self.last_spawn = Some(Instant::now());
-        eprintln!("[sensors] no live feed — killing stale helpers, respawning");
+        slog("no live feed — killing stale helpers, respawning");
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
         }
@@ -275,16 +275,23 @@ impl SensorFeed {
     fn spawn(&mut self) {
         let Some(exe) = helper_candidates().into_iter().find(|p| p.exists())
         else {
-            eprintln!("[sensors] {HELPER_EXE} not found (bundled or vendor)");
+            slog(&format!("{HELPER_EXE} not found (bundled or vendor)"));
             return;
         };
         let dir = exe
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
+        // pin the child's TEMP/TMP to the interactive user's temp — under
+        // Task Scheduler or other non-interactive contexts our own TEMP
+        // can point at a system dir, and the helper would drop its bin
+        // somewhere we can't reliably read
+        let temp = user_temp();
         match Command::new(&exe)
             .args([OUR_NAME, "1800", "0"])
             .current_dir(&dir)
+            .env("TEMP", &temp)
+            .env("TMP", &temp)
             // SystemInfos.exe is console-subsystem — never show its window
             .creation_flags(
                 windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
@@ -292,7 +299,7 @@ impl SensorFeed {
             .spawn()
         {
             Ok(c) => {
-                eprintln!("[sensors] spawned SystemInfos.exe pid={}", c.id());
+                slog(&format!("spawned {} pid={} cwd={}", exe.display(), c.id(), dir.display()));
                 crate::job::protect(c.id()); // reap even on taskkill /F
                 self.child = Some(c);
             }
@@ -300,9 +307,11 @@ impl SensorFeed {
                 // ERROR_ELEVATION_REQUIRED (740): the exe manifest demands
                 // admin. Delegate to `Start-Process` — the UAC prompt is
                 // raised automatically by the exe's manifest. No wait.
-                eprintln!("[sensors] normal spawn failed ({e}); elevating via Start-Process");
+                slog(&format!("normal spawn failed ({e}); elevating via Start-Process"));
                 let ps = format!(
-                    "Start-Process -FilePath '{}' -ArgumentList '{}','1800','0' -WorkingDirectory '{}' -WindowStyle Hidden",
+                    "$env:TEMP='{}'; $env:TMP='{}'; Start-Process -FilePath '{}' -ArgumentList '{}','1800','0' -WorkingDirectory '{}' -WindowStyle Hidden",
+                    temp.display(),
+                    temp.display(),
                     exe.display(),
                     OUR_NAME,
                     dir.display()
@@ -314,8 +323,8 @@ impl SensorFeed {
                     )
                     .spawn()
                 {
-                    Ok(_) => eprintln!("[sensors] elevated spawn requested (UAC may appear)"),
-                    Err(e2) => eprintln!("[sensors] elevated spawn failed: {e2}"),
+                    Ok(_) => slog("elevated spawn requested (UAC may appear)"),
+                    Err(e2) => slog(&format!("elevated spawn failed: {e2}")),
                 }
             }
         }
@@ -358,7 +367,7 @@ impl SensorFeed {
                 self.alive = true;
                 // never spam: first failure only per feed
                 if self.last_sample.cpu_tctl == 0.0 {
-                    eprintln!("[sensors] bin parse failed: {e}");
+                    slog(&format!("bin parse failed: {e}"));
                 }
                 return None;
             }
@@ -405,6 +414,9 @@ pub fn start_feed(stop: Arc<AtomicBool>) -> SensorHandle {
         while !stop.load(Ordering::Relaxed) {
             match feed.poll() {
                 Some(s) => {
+                    if !was_alive {
+                        slog("feed live");
+                    }
                     was_alive = true;
                     *h.inner.lock().unwrap() = s;
                     h.generation.fetch_add(1, Ordering::Relaxed);
@@ -414,6 +426,7 @@ pub fn start_feed(stop: Arc<AtomicBool>) -> SensorHandle {
                     // the UI drops to "---" instead of freezing on the
                     // last values forever
                     if !feed.alive() && was_alive {
+                        slog("feed dead — UI shows ---");
                         was_alive = false;
                         *h.inner.lock().unwrap() = SysSample::default();
                         h.generation.fetch_add(1, Ordering::Relaxed);
@@ -558,8 +571,36 @@ fn extract(b: &BinFile) -> SysSample {
     s
 }
 
+/// The interactive user's temp dir — forced onto spawned helpers via
+/// TEMP/TMP env, so their bin lands exactly where we read it.
+fn user_temp() -> PathBuf {
+    temp_roots()
+        .into_iter()
+        .next()
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn bin_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{name}.bin"))
+    user_temp().join(format!("{name}.bin"))
+}
+
+/// Append a line to %APPDATA%\ocydash\sensors.log — the release build is
+/// windowless, so this file is the only way to see what the feed did in
+/// production (spawns, adoptions, recoveries, transitions).
+fn slog(msg: &str) {
+    eprintln!("[sensors] {msg}");
+    let Ok(ap) = std::env::var("APPDATA") else { return };
+    let dir = PathBuf::from(ap).join("ocydash");
+    let _ = fs::create_dir_all(&dir);
+    let line = format!("{} {msg}\n", chrono::Local::now().format("%H:%M:%S"));
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("sensors.log"))
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 /// Where the helper can live, most-likely first: the bundled copy

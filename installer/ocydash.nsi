@@ -52,10 +52,10 @@ Section "Install"
     File /nonfatal "..\README.md"
     File "..\assets\ocydash.ico"
 
-    ; sensor feed helper + its HWiNFO dll (resolved relative to the exe)
+    ; sensor feed helper + ALL of its dependencies — recursive copy so
+    ; any dll/sys/subfolder added later is packaged automatically
     SetOutPath "$INSTDIR\SystemInfos"
-    File /nonfatal "..\vendor\SystemInfos\SystemInfos.exe"
-    File /nonfatal "..\vendor\SystemInfos\HWiNFO64.dll"
+    File /r /x README.txt "..\vendor\SystemInfos\*.*"
     SetOutPath "$INSTDIR"
 
     WriteUninstaller "$INSTDIR\uninstall.exe"

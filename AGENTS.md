@@ -55,9 +55,16 @@ Helper resolution (`helper_candidates`): bundled `<exe>\SystemInfos\
 SystemInfos.exe` first (installed by the NSIS script from
 `vendor/SystemInfos/` — exe + HWiNFO64.dll, resolved relative to
 current_exe, never a hardcoded path), then the vendor install dir.
+Spawn pins `current_dir` to the helper's own folder and forces
+`TEMP`/`TMP` = `user_temp()` (USERPROFILE\AppData\Local\Temp) so the
+bin lands exactly where `bin_path`/`bin_candidates` read — immune to
+Task Scheduler env mangling.
 `SysSample.alive`: false → widgets render "---" and bars draw empty —
 only a fresh bin parse sets it true; the sensor thread publishes one
 dead sample on the alive→dead transition so stale values never freeze.
+`slog()` appends feed events to %APPDATA%\ocydash\sensors.log — the
+windowless build's only production diagnostics; check it first when
+sensors stay "---".
 
 Heartbeat recovery (`SensorFeed.recover`): feed static >5s (`STALE_AFTER`)
 → `ensure()` rescans all `Ocypus*.bin` writers across every temp root —
