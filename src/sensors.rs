@@ -1,0 +1,526 @@
+//! CPU sensor feed via the official `SystemInfos.exe` helper (HWiNFO64.dll).
+//!
+//! The helper writes %TEMP%\<name>.bin = [u32 LE json_len][utf8 JSON]
+//! containing `cpuLayout.temperature_list[]` with direct Tctl/Tdie values.
+//! NOTE: the helper uses a memory-mapped file — contents update in real
+//! time while the file mtime stays frozen, so aliveness is detected by
+//! watching the embedded `systemTime`/`pid` fields, never the mtime.
+//!
+//! We reuse any live writer (e.g. while the official app runs) and only
+//! spawn a new helper when no live feed exists.
+
+use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::os::windows::process::CommandExt;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const HELPER_DIR: &str =
+    r"C:\Program Files\Ocypus Display\resources\main\SDK\VC#\SystemInfos\vs2008\bin\x64\Release";
+const HELPER_EXE: &str = "SystemInfos.exe";
+const OUR_NAME: &str = "OcypusRust";
+/// Respawn the helper if no content change for this long.
+const STALE_AFTER: Duration = Duration::from_secs(10);
+/// Never attempt more than one spawn per this interval (UAC storms are bad).
+const SPAWN_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default, Clone)]
+pub struct SysSample {
+    /// CPU (Tctl/Tdie) °C
+    pub cpu_tctl: f64,
+    /// CPU Die average °C
+    pub cpu_die: f64,
+    /// CPU utilization % (0-100)
+    pub cpu_load: f64,
+    /// CPU package power W
+    pub cpu_power: f64,
+    /// CPU CCD1 °C
+    pub cpu_ccd1: f64,
+    /// GPU temp °C
+    pub gpu_temp: f64,
+    /// GPU utilization %
+    pub gpu_load: f64,
+    /// GPU power W
+    pub gpu_power: f64,
+    /// Motherboard CPU-fan header RPM
+    pub cpu_fan: f64,
+    /// Pump RPM (best-effort: "pump"/"system"/fastest non-CPU mb header)
+    pub pump_fan: f64,
+    /// GPU Fan1 RPM
+    pub gpu_fan: f64,
+    /// e.g. "AMD Ryzen 7 9800X3D"
+    pub cpu_name: String,
+    /// e.g. "NVIDIA GeForce RTX 5070 Ti"
+    pub gpu_name: String,
+    /// RAM total GB
+    pub ram_total: f64,
+    /// RAM used GB
+    pub ram_used: f64,
+    /// RAM free GB
+    pub ram_free: f64,
+    /// RAM utilization %
+    pub ram_load: f64,
+
+    // Full reported lists per category — (display name, value) pairs.
+    // Widgets use these for the manual sensor override (sensor_idx);
+    // index 0 = the automatic pick above, n>0 = entry n-1 here.
+    // Arc-wrapped so SysSample::clone() (feed.latest() per call) stays
+    // a handful of refcount bumps, not ~150 String allocations.
+    pub cpu_temps: Arc<Vec<(String, f64)>>,
+    pub cpu_loads: Arc<Vec<(String, f64)>>,
+    pub cpu_powers: Arc<Vec<(String, f64)>>,
+    pub cpu_fans: Arc<Vec<(String, f64)>>,
+    pub gpu_temps: Arc<Vec<(String, f64)>>,
+    pub gpu_loads: Arc<Vec<(String, f64)>>,
+    pub gpu_powers: Arc<Vec<(String, f64)>>,
+    pub gpu_fans: Arc<Vec<(String, f64)>>,
+    pub ram_loads: Arc<Vec<(String, f64)>>,
+}
+
+/// Sensor categories a widget can draw from (drives the Inspector dropdown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorCat {
+    CpuTemp,
+    CpuLoad,
+    CpuPower,
+    CpuFan,
+    GpuTemp,
+    GpuLoad,
+    GpuPower,
+    GpuFan,
+    RamLoad,
+}
+
+impl SysSample {
+    /// (name, value) entries available for a category.
+    pub fn sensor_list(&self, cat: SensorCat) -> &[(String, f64)] {
+        match cat {
+            SensorCat::CpuTemp => &self.cpu_temps,
+            SensorCat::CpuLoad => &self.cpu_loads,
+            SensorCat::CpuPower => &self.cpu_powers,
+            SensorCat::CpuFan => &self.cpu_fans,
+            SensorCat::GpuTemp => &self.gpu_temps,
+            SensorCat::GpuLoad => &self.gpu_loads,
+            SensorCat::GpuPower => &self.gpu_powers,
+            SensorCat::GpuFan => &self.gpu_fans,
+            SensorCat::RamLoad => &self.ram_loads,
+        }
+    }
+
+    /// Resolve a widget's sensor_idx: 0 → the automatic `auto` value,
+    /// n>0 → list entry n-1 (falling back to `auto` when out of range).
+    pub fn override_value(&self, cat: SensorCat, idx: usize, auto: f64) -> f64 {
+        if idx == 0 {
+            return auto;
+        }
+        self.sensor_list(cat)
+            .get(idx - 1)
+            .map(|e| e.1)
+            .unwrap_or(auto)
+    }
+}
+
+#[derive(Deserialize)]
+struct BinFile {
+    #[serde(rename = "cpuLayout", default)]
+    cpu: Layout,
+    #[serde(rename = "graphics", default)]
+    gpu: Layout,
+    #[serde(rename = "memLayout", default)]
+    mem: MemLayout,
+    #[serde(rename = "systemTime", default)]
+    system_time: String,
+}
+
+/// memLayout has GB values as direct fields (not sensor lists).
+#[derive(Deserialize, Default)]
+struct MemLayout {
+    #[serde(default)]
+    used: f64,
+    #[serde(default)]
+    total: f64,
+    #[serde(default)]
+    free: f64,
+    #[serde(default)]
+    utilization_list: Vec<SensorEntry>,
+}
+
+#[derive(Deserialize, Default)]
+struct Layout {
+    #[serde(default)]
+    temperature_list: Vec<SensorEntry>,
+    #[serde(default)]
+    utilization_list: Vec<SensorEntry>,
+    #[serde(rename = "powerDraw_list", default)]
+    power_draw_list: Vec<SensorEntry>,
+    #[serde(rename = "fanSpeed_list", default)]
+    fan_speed_list: Vec<SensorEntry>,
+    #[serde(default)]
+    name_list: Vec<SensorEntry>,
+}
+
+#[derive(Deserialize)]
+struct SensorEntry {
+    #[serde(default)]
+    sensorname: String,
+    /// Numeric for sensors, a string for name_list entries — must stay
+    /// untyped or one bad entry kills the whole bin parse.
+    #[serde(default)]
+    value: serde_json::Value,
+    #[serde(default)]
+    checked: bool,
+}
+
+/// numeric value of an entry (handles "46.6" strings too)
+fn num(v: &serde_json::Value) -> f64 {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// display string of an entry (name_list keeps the name in `value`)
+fn text_of(e: &SensorEntry) -> String {
+    match &e.value {
+        serde_json::Value::String(s) => s.clone(),
+        _ => e.sensorname.clone(),
+    }
+}
+
+pub struct SensorFeed {
+    bin_path: PathBuf,
+    last_hash: u64,
+    last_sample: SysSample,
+    last_change: Instant,
+    last_spawn: Option<Instant>,
+    child: Option<Child>,
+}
+
+impl SensorFeed {
+    pub fn new() -> Self {
+        Self {
+            bin_path: bin_path(OUR_NAME),
+            last_hash: 0,
+            last_sample: SysSample::default(),
+            last_change: Instant::now(),
+            last_spawn: None,
+            child: None,
+        }
+    }
+
+    /// Pick the best live feed (prefer our own writer, else any other
+    /// live Ocypus*.bin writer), spawning the helper only if nothing lives.
+    pub fn ensure(&mut self) {
+        if let Some(t) = self.last_spawn {
+            if t.elapsed() < SPAWN_BACKOFF {
+                return;
+            }
+        }
+        for p in bin_candidates() {
+            if bin_alive(&p) {
+                eprintln!("[sensors] live feed: {}", p.display());
+                self.bin_path = p;
+                self.last_change = Instant::now();
+                return;
+            }
+        }
+        eprintln!("[sensors] no live feed found — requesting elevated helper");
+        self.spawn();
+    }
+
+    fn spawn(&mut self) {
+        self.last_spawn = Some(Instant::now());
+        let exe = PathBuf::from(HELPER_DIR).join(HELPER_EXE);
+        match Command::new(&exe)
+            .args([OUR_NAME, "1800", "0"])
+            .current_dir(HELPER_DIR)
+            // SystemInfos.exe is console-subsystem — never show its window
+            .creation_flags(
+                windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+            )
+            .spawn()
+        {
+            Ok(c) => {
+                eprintln!("[sensors] spawned SystemInfos.exe pid={}", c.id());
+                crate::job::protect(c.id()); // reap even on taskkill /F
+                self.child = Some(c);
+            }
+            Err(e) => {
+                // ERROR_ELEVATION_REQUIRED (740): the exe manifest demands
+                // admin. Delegate to `Start-Process` — the UAC prompt is
+                // raised automatically by the exe's manifest. No wait.
+                eprintln!("[sensors] normal spawn failed ({e}); elevating via Start-Process");
+                let ps = format!(
+                    "Start-Process -FilePath '{}' -ArgumentList '{}','1800','0' -WorkingDirectory '{}' -WindowStyle Hidden",
+                    exe.display(),
+                    OUR_NAME,
+                    HELPER_DIR
+                );
+                match Command::new("powershell")
+                    .args(["-NoProfile", "-Command", &ps])
+                    .creation_flags(
+                        windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+                    )
+                    .spawn()
+                {
+                    Ok(_) => eprintln!("[sensors] elevated spawn requested (UAC may appear)"),
+                    Err(e2) => eprintln!("[sensors] elevated spawn failed: {e2}"),
+                }
+            }
+        }
+    }
+
+    /// Poll the bin file; returns Some(sample) only when content changed.
+    pub fn poll(&mut self) -> Option<SysSample> {
+        let raw = fs::read(&self.bin_path).ok();
+        let raw = match raw {
+            Some(r) if r.len() >= 4 => r,
+            _ => {
+                // file missing entirely -> ensure a writer exists
+                self.ensure();
+                return None;
+            }
+        };
+        let h = hash(&raw);
+        if h == self.last_hash {
+            if self.last_change.elapsed() > STALE_AFTER {
+                // writer died or never started — (re)acquire a feed
+                self.ensure();
+                self.last_change = Instant::now();
+            }
+            return None;
+        }
+        let n = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        if n == 0 || n + 4 > raw.len() {
+            return None;
+        }
+        let parsed: BinFile = match serde_json::from_slice(&raw[4..4 + n]) {
+            Ok(p) => p,
+            Err(e) => {
+                // never spam: first failure only per feed
+                if self.last_sample.cpu_tctl == 0.0 {
+                    eprintln!("[sensors] bin parse failed: {e}");
+                }
+                return None;
+            }
+        };
+        self.last_hash = h;
+        self.last_change = Instant::now();
+        self.last_sample = extract(&parsed);
+        Some(self.last_sample.clone())
+    }
+
+}
+
+/// Shared state published by the background sensor thread.
+#[derive(Clone)]
+pub struct SensorHandle {
+    inner: Arc<Mutex<SysSample>>,
+    /// bumped whenever a new sample lands — cheap "changed" signal.
+    generation: Arc<AtomicU64>,
+}
+
+impl SensorHandle {
+    pub fn latest(&self) -> SysSample {
+        self.inner.lock().unwrap().clone()
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+}
+
+/// Spawn the background sensor thread (owns SensorFeed; blocking spawn /
+/// staleness checks never stall the caller). The thread exits when `stop`
+/// is set — dropping SensorFeed then reaps the helper child it spawned.
+pub fn start_feed(stop: Arc<AtomicBool>) -> SensorHandle {
+    let handle = SensorHandle {
+        inner: Arc::new(Mutex::new(SysSample::default())),
+        generation: Arc::new(AtomicU64::new(0)),
+    };
+    let h = handle.clone();
+    std::thread::spawn(move || {
+        let mut feed = SensorFeed::new();
+        feed.ensure();
+        while !stop.load(Ordering::Relaxed) {
+            match feed.poll() {
+                Some(s) => {
+                    *h.inner.lock().unwrap() = s;
+                    h.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                None => std::thread::sleep(Duration::from_millis(150)),
+            }
+        }
+        // feed drops here → its `impl Drop` kills the SystemInfos child
+    });
+    handle
+}
+
+fn hash(b: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    b.hash(&mut h);
+    h.finish()
+}
+
+/// A writer is alive if the embedded `systemTime` field advances within a
+/// short window (memory-mapped writes don't touch mtime).
+fn bin_alive(path: &PathBuf) -> bool {
+    let t1 = read_system_time(path);
+    std::thread::sleep(Duration::from_millis(2300));
+    let t2 = read_system_time(path);
+    matches!((t1, t2), (Some(a), Some(b)) if a != b)
+}
+
+fn read_system_time(path: &PathBuf) -> Option<String> {
+    let raw = fs::read(path).ok()?;
+    if raw.len() < 4 {
+        return None;
+    }
+    let n = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    if n == 0 || n + 4 > raw.len() {
+        return None;
+    }
+    let v: BinFile = serde_json::from_slice(&raw[4..4 + n]).ok()?;
+    if v.system_time.is_empty() {
+        None
+    } else {
+        Some(v.system_time)
+    }
+}
+
+fn pick(list: &[SensorEntry], needle: &str) -> f64 {
+    if list.is_empty() {
+        return 0.0;
+    }
+    // mimic official app: prefer `checked`, else name match, else first.
+    if let Some(e) = list.iter().find(|e| e.checked) {
+        return num(&e.value);
+    }
+    if let Some(e) = list.iter().find(|e| e.sensorname.contains(needle)) {
+        return num(&e.value);
+    }
+    num(&list[0].value)
+}
+
+/// Motherboard fan header matching an exact suffix (e.g. ": CPU").
+fn pick_fan(list: &[SensorEntry], suffix: &str) -> f64 {
+    list.iter()
+        .find(|e| e.sensorname.ends_with(suffix))
+        .map(|e| num(&e.value))
+        .unwrap_or(0.0)
+}
+
+/// Best-effort pump detection: name containing "pump", then "system",
+/// else the fastest mb header that isn't the CPU fan (pumps spin ~3-8k).
+fn pick_pump(list: &[SensorEntry]) -> f64 {
+    if let Some(e) = list.iter().find(|e| e.sensorname.to_lowercase().contains("pump")) {
+        return num(&e.value);
+    }
+    if let Some(e) = list.iter().find(|e| e.sensorname.to_lowercase().contains("system")) {
+        return num(&e.value);
+    }
+    list.iter()
+        .filter(|e| !e.sensorname.ends_with(": CPU") && !e.sensorname.ends_with("CPU_OPT"))
+        .map(|e| num(&e.value))
+        .fold(0.0, f64::max)
+}
+
+fn to_pairs(list: &[SensorEntry]) -> Vec<(String, f64)> {
+    list.iter()
+        .map(|e| (e.sensorname.clone(), num(&e.value)))
+        .collect()
+}
+
+fn extract(b: &BinFile) -> SysSample {
+    let cpu = &b.cpu;
+    let gpu = &b.gpu;
+    let mut s = SysSample {
+        cpu_tctl: pick(&cpu.temperature_list, "Tctl/Tdie"),
+        cpu_load: pick(&cpu.utilization_list, "Total CPU Usage"),
+        cpu_power: pick(&cpu.power_draw_list, "Package"),
+        gpu_temp: pick(&gpu.temperature_list, "GPU"),
+        gpu_load: pick(&gpu.utilization_list, "GPU"),
+        gpu_power: pick(&gpu.power_draw_list, "GPU"),
+        cpu_fan: pick_fan(&cpu.fan_speed_list, ": CPU"),
+        pump_fan: pick_pump(&cpu.fan_speed_list),
+        gpu_fan: gpu.fan_speed_list.first().map(|e| num(&e.value)).unwrap_or(0.0),
+        cpu_name: cpu.name_list.first().map(text_of).unwrap_or_default(),
+        gpu_name: gpu.name_list.first().map(text_of).unwrap_or_default(),
+        ram_total: b.mem.total,
+        ram_used: b.mem.used,
+        ram_free: b.mem.free,
+        ram_load: {
+            let v = pick(&b.mem.utilization_list, "Memory");
+            if v > 0.0 {
+                v
+            } else if b.mem.total > 0.0 {
+                b.mem.used / b.mem.total * 100.0
+            } else {
+                0.0
+            }
+        },
+        cpu_temps: Arc::new(to_pairs(&cpu.temperature_list)),
+        cpu_loads: Arc::new(to_pairs(&cpu.utilization_list)),
+        cpu_powers: Arc::new(to_pairs(&cpu.power_draw_list)),
+        cpu_fans: Arc::new(to_pairs(&cpu.fan_speed_list)),
+        gpu_temps: Arc::new(to_pairs(&gpu.temperature_list)),
+        gpu_loads: Arc::new(to_pairs(&gpu.utilization_list)),
+        gpu_powers: Arc::new(to_pairs(&gpu.power_draw_list)),
+        gpu_fans: Arc::new(to_pairs(&gpu.fan_speed_list)),
+        ram_loads: Arc::new(to_pairs(&b.mem.utilization_list)),
+        ..Default::default()
+    };
+    for e in &cpu.temperature_list {
+        if e.sensorname.contains("Die (average)") {
+            s.cpu_die = num(&e.value);
+        } else if e.sensorname.contains("CCD1") {
+            s.cpu_ccd1 = num(&e.value);
+        }
+    }
+    s
+}
+
+fn bin_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{name}.bin"))
+}
+
+/// All plausible live feed files: our own bin first, then any other
+/// `Ocypus*.bin` writer (official app, probe helpers) in the user temp
+/// dir — plus the elevated system temp dir as a fallback (a helper whose
+/// env did not inherit would land there).
+fn bin_candidates() -> Vec<PathBuf> {
+    let mut out = vec![bin_path(OUR_NAME)];
+    for dir in [std::env::temp_dir(), PathBuf::from(r"C:\Windows\Temp")] {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let is_bin = p
+                    .file_name()
+                    .map(|n| {
+                        let s = n.to_string_lossy();
+                        s.starts_with("Ocypus") && s.ends_with(".bin")
+                    })
+                    .unwrap_or(false);
+                if is_bin && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+impl Drop for SensorFeed {
+    fn drop(&mut self) {
+        if let Some(c) = &mut self.child {
+            // SystemInfos.exe may be driver-protected; best-effort kill
+            // (mirrors official app behaviour).
+            let _ = c.kill();
+        }
+    }
+}

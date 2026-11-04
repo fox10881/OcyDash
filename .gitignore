@@ -1,0 +1,12 @@
+target/
+tools/asar_out/
+tools/__pycache__/
+*.jpg
+
+# build outputs & bundled binaries (see README for how to fetch)
+dist/
+vendor/ffmpeg/ffmpeg.exe
+
+# stray logs & shell-redirect accidents
+*.log
+nul
