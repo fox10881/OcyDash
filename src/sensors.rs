@@ -389,12 +389,18 @@ fn hash(b: &[u8]) -> u64 {
 }
 
 /// A writer is alive if the embedded `systemTime` field advances within a
-/// short window (memory-mapped writes don't touch mtime).
+/// short window (memory-mapped writes don't touch mtime). Missing/corrupt
+/// files bail instantly — no 2.3s sleep on dead candidates.
 fn bin_alive(path: &PathBuf) -> bool {
-    let t1 = read_system_time(path);
+    let t1 = match read_system_time(path) {
+        Some(t) => t,
+        None => return false,
+    };
     std::thread::sleep(Duration::from_millis(2300));
-    let t2 = read_system_time(path);
-    matches!((t1, t2), (Some(a), Some(b)) if a != b)
+    match read_system_time(path) {
+        Some(t2) => t2 != t1,
+        None => false,
+    }
 }
 
 fn read_system_time(path: &PathBuf) -> Option<String> {
@@ -522,18 +528,45 @@ fn kill_helpers() {
         .status();
 }
 
-/// All plausible live feed files: our own bin first, then any other
-/// `Ocypus*.bin` writer. Roots cover every context the helper can run in:
-/// our TEMP, the user's real LOCALAPPDATA\Temp (ground truth when TEMP is
-/// overridden or the process runs elevated/via Task Scheduler), and the
-/// system temp dir for SYSTEM-context writers.
-fn bin_candidates() -> Vec<PathBuf> {
-    let mut out = vec![bin_path(OUR_NAME)];
-    let mut roots = vec![std::env::temp_dir(), PathBuf::from(r"C:\Windows\Temp")];
+/// Temp roots to scan — explicit user-profile paths come first because
+/// elevation / Task Scheduler can make `temp_dir()` resolve to a system
+/// dir while SystemInfos.exe (and every other writer) still lands in the
+/// INTERACTIVE user's `C:\Users\<user>\AppData\Local\Temp`.
+fn temp_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        roots.push(PathBuf::from(up).join(r"AppData\Local\Temp"));
+    }
+    if let (Ok(drive), Ok(user)) =
+        (std::env::var("SystemDrive"), std::env::var("USERNAME"))
+    {
+        roots.push(
+            PathBuf::from(drive)
+                .join("Users")
+                .join(user)
+                .join(r"AppData\Local\Temp"),
+        );
+    }
     if let Ok(la) = std::env::var("LOCALAPPDATA") {
         roots.push(PathBuf::from(la).join("Temp"));
     }
-    for dir in roots {
+    // our own env-derived temp (where OUR spawned helper writes — it
+    // inherits our env) plus the system temp for SYSTEM-context writers
+    roots.push(std::env::temp_dir());
+    roots.push(PathBuf::from(r"C:\Windows\Temp"));
+    roots
+}
+
+/// All plausible live feed files: our own bin first, then any other
+/// `Ocypus*.bin` writer (official app, probe helpers) in every temp root
+/// the helper can land in. Roots are deduped case-insensitively.
+fn bin_candidates() -> Vec<PathBuf> {
+    let mut out = vec![bin_path(OUR_NAME)];
+    let mut seen = std::collections::HashSet::new();
+    for dir in temp_roots() {
+        if !seen.insert(dir.to_string_lossy().to_lowercase()) {
+            continue;
+        }
         if let Ok(rd) = fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();

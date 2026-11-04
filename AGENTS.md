@@ -52,8 +52,10 @@ admin token with no UAC; the powershell `Start-Process` fallback remains
 for non-elevated edge cases.
 
 Heartbeat recovery (`SensorFeed.recover`): feed static >5s (`STALE_AFTER`)
-→ `ensure()` rescans all `Ocypus*.bin` writers across temp_dir +
-LOCALAPPDATA\Temp + C:\Windows\Temp → nothing alive → `taskkill /F /IM
+→ `ensure()` rescans all `Ocypus*.bin` writers across every temp root —
+explicit `USERPROFILE\AppData\Local\Temp` + `C:\Users\<user>\AppData\Local
+\Temp` (ground truth under elevation/Task Scheduler), `LOCALAPPDATA\Temp`,
+`temp_dir()`, `C:\Windows\Temp` — → nothing alive → `taskkill /F /IM
 SystemInfos.exe` (clean slate — any survivor is a zombie) → respawn.
 `RESPAWN_BACKOFF` (12s) caps respawn frequency and doubles as helper
 warm-up grace. Respawns are silent now that we run elevated.
@@ -103,9 +105,12 @@ ocydash.exe --editor (~95MB RSS while open)
   resolved via SysSample::override_value(); the Inspector shows a
   ComboBox for any WidgetKind::sensor_cat() != None.
 - `src/startup.rs`   Task Scheduler logon task `OcyDash` (schtasks /create
-  /sc onlogon /rl highest) — the ONLY silent autostart for an elevated app;
-  Windows ignores HKCU Run entries that would trigger UAC. Legacy Run
-  value is cleaned up on toggle; uninstaller deletes the task.
+  /sc onlogon /ru USERDOMAIN\USERNAME /it /rl highest) — the ONLY silent
+  autostart for an elevated app; Windows ignores HKCU Run entries that
+  would trigger UAC. `/ru`+`/it` pins the task to the user's INTERACTIVE
+  session — without it the task can run non-interactively where TEMP
+  resolves to a system dir and the sensor feed dies (frozen at boot).
+  Legacy Run value is cleaned up on toggle; uninstaller deletes the task.
 - `src/icon.rs`      shared green-disc artwork (tray, window icon, .ico)
 - `build.rs`         embed-resource → assets/ocydash.rc embeds the app icon,
   VERSIONINFO + requireAdministrator manifest (assets/ocydash.manifest);

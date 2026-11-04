@@ -36,10 +36,20 @@ pub fn set(enabled: bool) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         // quoted path — Program Files contains spaces; no args = headless
         let tr = format!("\"{}\"", exe.display());
-        if schtasks(&[
-            "/create", "/tn", TASK_NAME, "/tr", &tr, "/sc", "onlogon", "/rl",
-            "highest", "/f",
-        ])? {
+        // /ru <user> /it → the task runs inside THAT user's interactive
+        // logon session (no stored password). Without it the task can run
+        // in a non-interactive context: TEMP resolves to a system dir,
+        // the sensor helper can't reach the session, and the classic
+        // "works manually, frozen after reboot" bug appears.
+        let ru = runas_principal();
+        let mut args = vec![
+            "/create", "/tn", TASK_NAME, "/tr", tr.as_str(), "/sc", "onlogon",
+        ];
+        if !ru.is_empty() {
+            args.extend(["/ru", ru.as_str(), "/it"]);
+        }
+        args.extend(["/rl", "highest", "/f"]);
+        if schtasks(&args)? {
             Ok(())
         } else {
             Err("schtasks /create failed".into())
@@ -48,6 +58,19 @@ pub fn set(enabled: bool) -> Result<(), String> {
         Ok(())
     } else {
         Err("schtasks /delete failed".into())
+    }
+}
+
+/// `DOMAIN\user` (or bare `user`) for schtasks /ru — the account that
+/// owns the interactive logon session the task must run in.
+fn runas_principal() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        return String::new();
+    }
+    match std::env::var("USERDOMAIN") {
+        Ok(d) if !d.is_empty() => format!("{d}\\{user}"),
+        _ => user,
     }
 }
 
