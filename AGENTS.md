@@ -49,9 +49,14 @@ Official app spawns `resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
 `requireAdministrator` (`assets/ocydash.manifest` → `1 24` in
 `assets/ocydash.rc`), so the direct `Command::new` spawn inherits the
 admin token with no UAC; the powershell `Start-Process` fallback remains
-for non-elevated edge cases. The helper is spawned **exactly once per
-process** (`SensorFeed.spawned`) — stale feeds only rescan existing
-writers, never respawn (respawning = UAC spam at every retry).
+for non-elevated edge cases.
+
+Heartbeat recovery (`SensorFeed.recover`): feed static >5s (`STALE_AFTER`)
+→ `ensure()` rescans all `Ocypus*.bin` writers across temp_dir +
+LOCALAPPDATA\Temp + C:\Windows\Temp → nothing alive → `taskkill /F /IM
+SystemInfos.exe` (clean slate — any survivor is a zombie) → respawn.
+`RESPAWN_BACKOFF` (12s) caps respawn frequency and doubles as helper
+warm-up grace. Respawns are silent now that we run elevated.
 
 ## Build / run
 

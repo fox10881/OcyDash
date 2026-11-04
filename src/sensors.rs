@@ -15,7 +15,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,8 +24,12 @@ const HELPER_DIR: &str =
     r"C:\Program Files\Ocypus Display\resources\main\SDK\VC#\SystemInfos\vs2008\bin\x64\Release";
 const HELPER_EXE: &str = "SystemInfos.exe";
 const OUR_NAME: &str = "OcypusRust";
-/// Respawn the helper if no content change for this long.
-const STALE_AFTER: Duration = Duration::from_secs(10);
+/// Feed is dead when its content hash stays static this long.
+const STALE_AFTER: Duration = Duration::from_secs(5);
+/// Minimum gap between kill+respawn attempts — doubles as the helper's
+/// warm-up grace (HWiNFO init takes a few seconds) and keeps a broken
+/// helper out of a kill/spawn thrash loop.
+const RESPAWN_BACKOFF: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Default, Clone)]
 pub struct SysSample {
@@ -196,9 +200,9 @@ pub struct SensorFeed {
     last_hash: u64,
     last_sample: SysSample,
     last_change: Instant,
-    /// the helper is spawned at most once per process lifetime —
-    /// every retry is another UAC prompt (users saw one every ~60s)
-    spawned: bool,
+    /// last kill+respawn attempt — respawns are silent now that ocydash
+    /// runs elevated, so a hung helper is recovered, not tolerated
+    last_spawn: Option<Instant>,
     child: Option<Child>,
 }
 
@@ -209,14 +213,15 @@ impl SensorFeed {
             last_hash: 0,
             last_sample: SysSample::default(),
             last_change: Instant::now(),
-            spawned: false,
+            last_spawn: None,
             child: None,
         }
     }
 
     /// Pick the best live feed (prefer our own writer, else any other
-    /// live Ocypus*.bin writer), spawning the helper exactly once when
-    /// nothing lives — stale feeds later only rescan bins, never respawn.
+    /// live Ocypus*.bin writer); when nothing is alive, kill every stale
+    /// SystemInfos.exe for a clean slate and respawn ours — heartbeat
+    /// recovery is silent now that ocydash runs elevated.
     pub fn ensure(&mut self) {
         for p in bin_candidates() {
             if bin_alive(&p) {
@@ -226,14 +231,32 @@ impl SensorFeed {
                 return;
             }
         }
-        if !self.spawned {
-            eprintln!("[sensors] no live feed found — requesting elevated helper");
-            self.spawn();
+        self.recover();
+    }
+
+    /// Kill orphaned/zombie helpers holding a bin, then respawn ours.
+    /// Backoff doubles as warm-up grace: a just-spawned helper gets
+    /// ~12s to start writing before it could ever be killed again.
+    fn recover(&mut self) {
+        if self
+            .last_spawn
+            .map(|t| t.elapsed() < RESPAWN_BACKOFF)
+            .unwrap_or(false)
+        {
+            return;
         }
+        self.last_spawn = Some(Instant::now());
+        eprintln!("[sensors] no live feed — killing stale helpers, respawning");
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+        }
+        kill_helpers();
+        self.spawn();
+        // repoint at our own bin — we may have adopted another writer earlier
+        self.bin_path = bin_path(OUR_NAME);
     }
 
     fn spawn(&mut self) {
-        self.spawned = true; // one attempt per process, success or not
         let exe = PathBuf::from(HELPER_DIR).join(HELPER_EXE);
         match Command::new(&exe)
             .args([OUR_NAME, "1800", "0"])
@@ -487,13 +510,30 @@ fn bin_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{name}.bin"))
 }
 
+/// Kill every SystemInfos.exe — any survivor is a stale writer or a
+/// zombie holding a bin file. Silent now that we run elevated
+/// (a non-admin taskkill can't touch the driver-protected process).
+fn kill_helpers() {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", HELPER_EXE])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// All plausible live feed files: our own bin first, then any other
-/// `Ocypus*.bin` writer (official app, probe helpers) in the user temp
-/// dir — plus the elevated system temp dir as a fallback (a helper whose
-/// env did not inherit would land there).
+/// `Ocypus*.bin` writer. Roots cover every context the helper can run in:
+/// our TEMP, the user's real LOCALAPPDATA\Temp (ground truth when TEMP is
+/// overridden or the process runs elevated/via Task Scheduler), and the
+/// system temp dir for SYSTEM-context writers.
 fn bin_candidates() -> Vec<PathBuf> {
     let mut out = vec![bin_path(OUR_NAME)];
-    for dir in [std::env::temp_dir(), PathBuf::from(r"C:\Windows\Temp")] {
+    let mut roots = vec![std::env::temp_dir(), PathBuf::from(r"C:\Windows\Temp")];
+    if let Ok(la) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(la).join("Temp"));
+    }
+    for dir in roots {
         if let Ok(rd) = fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
