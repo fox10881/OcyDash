@@ -10,3 +10,5 @@ vendor/ffmpeg/ffmpeg.exe
 # stray logs & shell-redirect accidents
 *.log
 nul
+vendor/SystemInfos/SystemInfos.exe
+vendor/SystemInfos/HWiNFO64.dll

@@ -52,6 +52,12 @@ Section "Install"
     File /nonfatal "..\README.md"
     File "..\assets\ocydash.ico"
 
+    ; sensor feed helper + its HWiNFO dll (resolved relative to the exe)
+    SetOutPath "$INSTDIR\SystemInfos"
+    File /nonfatal "..\vendor\SystemInfos\SystemInfos.exe"
+    File /nonfatal "..\vendor\SystemInfos\HWiNFO64.dll"
+    SetOutPath "$INSTDIR"
+
     WriteUninstaller "$INSTDIR\uninstall.exe"
 
     ; shortcuts — no args = headless tray service
@@ -97,6 +103,7 @@ Section "Uninstall"
     Delete "$INSTDIR\LICENSE"
     Delete "$INSTDIR\README.md"
     Delete "$INSTDIR\uninstall.exe"
+    RMDir /r "$INSTDIR\SystemInfos"
     RMDir "$INSTDIR"
 
     DeleteRegKey HKLM "${APP_UNINST}"

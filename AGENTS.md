@@ -51,6 +51,14 @@ Official app spawns `resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
 admin token with no UAC; the powershell `Start-Process` fallback remains
 for non-elevated edge cases.
 
+Helper resolution (`helper_candidates`): bundled `<exe>\SystemInfos\
+SystemInfos.exe` first (installed by the NSIS script from
+`vendor/SystemInfos/` — exe + HWiNFO64.dll, resolved relative to
+current_exe, never a hardcoded path), then the vendor install dir.
+`SysSample.alive`: false → widgets render "---" and bars draw empty —
+only a fresh bin parse sets it true; the sensor thread publishes one
+dead sample on the alive→dead transition so stale values never freeze.
+
 Heartbeat recovery (`SensorFeed.recover`): feed static >5s (`STALE_AFTER`)
 → `ensure()` rescans all `Ocypus*.bin` writers across every temp root —
 explicit `USERPROFILE\AppData\Local\Temp` + `C:\Users\<user>\AppData\Local

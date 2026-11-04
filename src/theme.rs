@@ -258,6 +258,9 @@ impl Widget {
             WidgetKind::RamLoad => self.val(s, RamLoad, s.ram_load),
             _ => return None,
         };
+        if !s.alive {
+            return Some(0.0); // dead feed → empty bar, not a frozen fill
+        }
         Some((v / 100.0).clamp(0.0, 1.0))
     }
 
@@ -273,6 +276,17 @@ impl Widget {
     pub fn text(&self, s: &crate::sensors::SysSample, now_secs: f64) -> String {
         use crate::sensors::SensorCat::*;
         let d = self.decimals as usize;
+        // disconnected feed → visible "---" instead of frozen numbers.
+        // Clock/CustomText aren't sensor data; a name widget with an
+        // override shows user text, not the feed's hardware name.
+        if !s.alive {
+            match &self.kind {
+                WidgetKind::Clock | WidgetKind::CustomText { .. } => {}
+                WidgetKind::CpuName | WidgetKind::GpuName
+                    if !self.text_override.is_empty() => {}
+                _ => return "---".into(),
+            }
+        }
         match &self.kind {
             WidgetKind::CpuTemp => {
                 format!("{:.*}{}", d, self.val(s, CpuTemp, s.cpu_tctl), if self.show_unit { "°C" } else { "" })

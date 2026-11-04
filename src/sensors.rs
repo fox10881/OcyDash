@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Vendor install of the helper — dev/legacy fallback when our bundled
+/// copy (installed as <exe>\SystemInfos\SystemInfos.exe) is absent.
 const HELPER_DIR: &str =
     r"C:\Program Files\Ocypus Display\resources\main\SDK\VC#\SystemInfos\vs2008\bin\x64\Release";
 const HELPER_EXE: &str = "SystemInfos.exe";
@@ -33,6 +35,9 @@ const RESPAWN_BACKOFF: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Default, Clone)]
 pub struct SysSample {
+    /// false = feed disconnected → UI renders "---" rather than frozen
+    /// numbers. Only `extract()` (a fresh parse) sets this true.
+    pub alive: bool,
     /// CPU (Tctl/Tdie) °C
     pub cpu_tctl: f64,
     /// CPU Die average °C
@@ -203,6 +208,9 @@ pub struct SensorFeed {
     /// last kill+respawn attempt — respawns are silent now that ocydash
     /// runs elevated, so a hung helper is recovered, not tolerated
     last_spawn: Option<Instant>,
+    /// true only while fresh parses keep arriving — a static bin or a
+    /// missing writer flips it and the UI drops to "---"
+    alive: bool,
     child: Option<Child>,
 }
 
@@ -214,8 +222,14 @@ impl SensorFeed {
             last_sample: SysSample::default(),
             last_change: Instant::now(),
             last_spawn: None,
+            alive: false,
             child: None,
         }
+    }
+
+    /// false while the feed is stale/missing — drives the "---" state
+    pub fn alive(&self) -> bool {
+        self.alive
     }
 
     /// Pick the best live feed (prefer our own writer, else any other
@@ -228,9 +242,11 @@ impl SensorFeed {
                 eprintln!("[sensors] live feed: {}", p.display());
                 self.bin_path = p;
                 self.last_change = Instant::now();
+                self.alive = true;
                 return;
             }
         }
+        self.alive = false;
         self.recover();
     }
 
@@ -257,10 +273,18 @@ impl SensorFeed {
     }
 
     fn spawn(&mut self) {
-        let exe = PathBuf::from(HELPER_DIR).join(HELPER_EXE);
+        let Some(exe) = helper_candidates().into_iter().find(|p| p.exists())
+        else {
+            eprintln!("[sensors] {HELPER_EXE} not found (bundled or vendor)");
+            return;
+        };
+        let dir = exe
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
         match Command::new(&exe)
             .args([OUR_NAME, "1800", "0"])
-            .current_dir(HELPER_DIR)
+            .current_dir(&dir)
             // SystemInfos.exe is console-subsystem — never show its window
             .creation_flags(
                 windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
@@ -281,7 +305,7 @@ impl SensorFeed {
                     "Start-Process -FilePath '{}' -ArgumentList '{}','1800','0' -WorkingDirectory '{}' -WindowStyle Hidden",
                     exe.display(),
                     OUR_NAME,
-                    HELPER_DIR
+                    dir.display()
                 );
                 match Command::new("powershell")
                     .args(["-NoProfile", "-Command", &ps])
@@ -303,7 +327,8 @@ impl SensorFeed {
         let raw = match raw {
             Some(r) if r.len() >= 4 => r,
             _ => {
-                // file missing entirely -> ensure a writer exists
+                // file missing entirely -> feed dead, ensure a writer exists
+                self.alive = false;
                 self.ensure();
                 return None;
             }
@@ -312,6 +337,7 @@ impl SensorFeed {
         if h == self.last_hash {
             if self.last_change.elapsed() > STALE_AFTER {
                 // writer died or never started — (re)acquire a feed
+                self.alive = false;
                 self.ensure();
                 self.last_change = Instant::now();
             }
@@ -324,6 +350,12 @@ impl SensorFeed {
         let parsed: BinFile = match serde_json::from_slice(&raw[4..4 + n]) {
             Ok(p) => p,
             Err(e) => {
+                // changing-but-unparseable bytes = writer mid-update —
+                // proven alive, so refresh the staleness clock instead of
+                // letting a transient torn read look like a dead feed
+                self.last_hash = h;
+                self.last_change = Instant::now();
+                self.alive = true;
                 // never spam: first failure only per feed
                 if self.last_sample.cpu_tctl == 0.0 {
                     eprintln!("[sensors] bin parse failed: {e}");
@@ -333,6 +365,7 @@ impl SensorFeed {
         };
         self.last_hash = h;
         self.last_change = Instant::now();
+        self.alive = true;
         self.last_sample = extract(&parsed);
         Some(self.last_sample.clone())
     }
@@ -368,13 +401,25 @@ pub fn start_feed(stop: Arc<AtomicBool>) -> SensorHandle {
     std::thread::spawn(move || {
         let mut feed = SensorFeed::new();
         feed.ensure();
+        let mut was_alive = false;
         while !stop.load(Ordering::Relaxed) {
             match feed.poll() {
                 Some(s) => {
+                    was_alive = true;
                     *h.inner.lock().unwrap() = s;
                     h.generation.fetch_add(1, Ordering::Relaxed);
                 }
-                None => std::thread::sleep(Duration::from_millis(150)),
+                None => {
+                    // alive→dead transition: publish a dead marker once so
+                    // the UI drops to "---" instead of freezing on the
+                    // last values forever
+                    if !feed.alive() && was_alive {
+                        was_alive = false;
+                        *h.inner.lock().unwrap() = SysSample::default();
+                        h.generation.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
             }
         }
         // feed drops here → its `impl Drop` kills the SystemInfos child
@@ -467,6 +512,7 @@ fn extract(b: &BinFile) -> SysSample {
     let cpu = &b.cpu;
     let gpu = &b.gpu;
     let mut s = SysSample {
+        alive: true, // a fresh parse is the ONLY proof of a live feed
         cpu_tctl: pick(&cpu.temperature_list, "Tctl/Tdie"),
         cpu_load: pick(&cpu.utilization_list, "Total CPU Usage"),
         cpu_power: pick(&cpu.power_draw_list, "Package"),
@@ -514,6 +560,22 @@ fn extract(b: &BinFile) -> SysSample {
 
 fn bin_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{name}.bin"))
+}
+
+/// Where the helper can live, most-likely first: the bundled copy
+/// installed beside ocydash.exe (`<exe>\SystemInfos\SystemInfos.exe`
+/// + HWiNFO64.dll — resolved relative to the running exe, never a
+/// hardcoded install path), then the vendor's own install for dev
+/// machines that have the official package.
+fn helper_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("SystemInfos").join(HELPER_EXE));
+        }
+    }
+    out.push(PathBuf::from(HELPER_DIR).join(HELPER_EXE));
+    out
 }
 
 /// Kill every SystemInfos.exe — any survivor is a stale writer or a
