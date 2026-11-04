@@ -1,12 +1,23 @@
 import struct, json, time, glob, os, subprocess
 
-def st(p):
+def read(p):
     try:
         d = open(p, 'rb').read(65536)
         n = struct.unpack('<I', d[:4])[0]
-        return json.loads(d[4:4 + n]).get('systemTime')
+        j = json.loads(d[4:4 + n])
+        return j
     except Exception:
         return None
+
+def probe(p):
+    j = read(p)
+    if not j:
+        return None, None, None
+    temps = j.get('cpuLayout', {}).get('temperature_list', [])
+    loads = j.get('cpuLayout', {}).get('utilization_list', [])
+    t = next((e['value'] for e in temps if 'Tctl' in e.get('sensorname', '')), None)
+    l = next((e['value'] for e in loads if 'Total' in e.get('sensorname', '')), None)
+    return j.get('systemTime'), t, l
 
 roots = [
     os.path.expandvars(r'%USERPROFILE%\AppData\Local\Temp'),
@@ -18,21 +29,21 @@ files = []
 for r in dict.fromkeys(roots):
     files += glob.glob(os.path.join(r, 'Ocypus*.bin'))
 
-t1 = {p: st(p) for p in files}
-time.sleep(4)
-for p in files:
-    t2 = st(p)
-    name = os.path.basename(p)
-    state = 'LIVE' if t1[p] and t2 and t2 != t1[p] else 'dead'
-    print(f'{name:24} {t1[p]} -> {t2}  {state}')
+print(f'{len(files)} bin files found across {len(set(roots))} roots')
+for round_ in range(6):
+    for p in files:
+        st_, temp, load = probe(p)
+        print(f'  [{round_}] {os.path.basename(p):22} sysTime={st_}  cpu_tctl={temp}  cpu_load={load}')
+    if round_ < 5:
+        time.sleep(3)
 
-# who is SystemInfos.exe?
+print('\n--- SystemInfos.exe processes ---')
 try:
     out = subprocess.check_output(
         ['powershell', '-NoProfile', '-Command',
          "Get-CimInstance Win32_Process -Filter \"Name='SystemInfos.exe'\" | "
-         "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | Format-List"],
+         "Select-Object ProcessId,ParentProcessId | Format-Table -AutoSize"],
         text=True, timeout=15)
     print(out)
 except Exception as e:
-    print('process query failed:', e)
+    print('query failed:', e)

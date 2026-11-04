@@ -75,8 +75,16 @@ explicit `USERPROFILE\AppData\Local\Temp` + `C:\Users\<user>\AppData\Local
 \Temp` (ground truth under elevation/Task Scheduler), `LOCALAPPDATA\Temp`,
 `temp_dir()`, `C:\Windows\Temp` — → nothing alive → `taskkill /F /IM
 SystemInfos.exe` (clean slate — any survivor is a zombie) → respawn.
-`RESPAWN_BACKOFF` (12s) caps respawn frequency and doubles as helper
-warm-up grace. Respawns are silent now that we run elevated.
+`SPAWN_GRACE` (40s): a spawned helper is never killed inside the window —
+covers HWiNFO kernel-driver init (first write can lag 30s+) and caps
+respawn frequency. Killing earlier = the write-once-then-die loop.
+
+Single writer (`Local\OcyDashSensorWriter` mutex): headless AND the
+editor each run a feed but only ONE may own the helper lifecycle —
+before this, their `taskkill /IM` calls murdered each other's helper
+every few seconds (the real "frozen values" root cause). Readers adopt
+the shared bin only; claim retried on each dead feed so the survivor
+promotes when the owner exits.
 
 ## Build / run
 

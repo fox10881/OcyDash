@@ -28,10 +28,11 @@ const HELPER_EXE: &str = "SystemInfos.exe";
 const OUR_NAME: &str = "OcypusRust";
 /// Feed is dead when its content hash stays static this long.
 const STALE_AFTER: Duration = Duration::from_secs(5);
-/// Minimum gap between kill+respawn attempts — doubles as the helper's
-/// warm-up grace (HWiNFO init takes a few seconds) and keeps a broken
-/// helper out of a kill/spawn thrash loop.
-const RESPAWN_BACKOFF: Duration = Duration::from_secs(12);
+/// A spawned helper is untouchable for this long — covers HWiNFO
+/// kernel-driver init (the first write can lag 30s+ on a cold load)
+/// AND caps respawn frequency. Killing it earlier is exactly the
+/// write-once-then-die loop the watchdog produced in production.
+const SPAWN_GRACE: Duration = Duration::from_secs(40);
 
 #[derive(Debug, Default, Clone)]
 pub struct SysSample {
@@ -211,6 +212,11 @@ pub struct SensorFeed {
     /// true only while fresh parses keep arriving — a static bin or a
     /// missing writer flips it and the UI drops to "---"
     alive: bool,
+    /// true when THIS process holds Local\OcyDashSensorWriter — only the
+    /// holder may kill/spawn the shared helper (see claim_writer)
+    writer: bool,
+    /// logged "reader mode" once — avoids spamming sensors.log
+    reader_logged: bool,
     child: Option<Child>,
 }
 
@@ -223,6 +229,8 @@ impl SensorFeed {
             last_change: Instant::now(),
             last_spawn: None,
             alive: false,
+            writer: false,
+            reader_logged: false,
             child: None,
         }
     }
@@ -250,15 +258,18 @@ impl SensorFeed {
         self.recover();
     }
 
-    /// Kill orphaned/zombie helpers holding a bin, then respawn ours.
-    /// Backoff doubles as warm-up grace: a just-spawned helper gets
-    /// ~12s to start writing before it could ever be killed again.
+    /// Kill orphaned/zombie helpers holding a bin, then respawn ours —
+    /// but ONLY in the process holding the writer mutex. Headless and
+    /// the editor each run a feed; without arbitration their
+    /// `taskkill /IM` calls murdered each other's helper every few
+    /// seconds — the actual cause of "values load once then freeze".
     fn recover(&mut self) {
-        if self
-            .last_spawn
-            .map(|t| t.elapsed() < RESPAWN_BACKOFF)
-            .unwrap_or(false)
-        {
+        if !self.is_writer() {
+            return;
+        }
+        // a just-spawned helper is still initializing (kernel driver
+        // load) — never kill during the grace window
+        if self.in_spawn_grace() {
             return;
         }
         self.last_spawn = Some(Instant::now());
@@ -267,9 +278,40 @@ impl SensorFeed {
             let _ = c.kill();
         }
         kill_helpers();
+        // give the killed helper a beat to release the single-client
+        // HWiNFO driver — respawning into a still-held slot is what
+        // parked every helper in GPU enumeration writing zero-bins
+        std::thread::sleep(Duration::from_millis(1500));
+        // drop the stale bin so the fresh writer's first parse can't
+        // flash dead values onto the panel
+        let _ = fs::remove_file(bin_path(OUR_NAME));
         self.spawn();
         // repoint at our own bin — we may have adopted another writer earlier
         self.bin_path = bin_path(OUR_NAME);
+    }
+
+    /// Claim the global writer role once, then keep retrying while a
+    /// reader — the owner hands it over on exit (WAIT_ABANDONED).
+    fn is_writer(&mut self) -> bool {
+        if !self.writer {
+            self.writer = claim_writer();
+            if self.writer {
+                slog("claimed sensor-writer role");
+            } else if !self.reader_logged {
+                self.reader_logged = true;
+                slog("reader mode — another OcyDash process owns the helper");
+            }
+        }
+        self.writer
+    }
+
+    /// True while a spawned helper is still inside its warm-up window —
+    /// staleness detected during this period means "still initializing",
+    /// never "kill it".
+    fn in_spawn_grace(&self) -> bool {
+        self.last_spawn
+            .map(|t| t.elapsed() < SPAWN_GRACE)
+            .unwrap_or(false)
     }
 
     fn spawn(&mut self) {
@@ -337,24 +379,38 @@ impl SensorFeed {
         let raw = match raw {
             Some(r) if r.len() >= 4 => r,
             _ => {
-                // file missing entirely -> feed dead, ensure a writer exists
+                // file missing entirely -> feed dead; rescan/adopt at
+                // most every 2s (last_change doubles as the ensure clock
+                // here — nothing else updates it while the file is gone)
                 self.alive = false;
-                self.ensure();
+                if self.last_change.elapsed() > Duration::from_secs(2) {
+                    self.ensure();
+                    self.last_change = Instant::now();
+                }
                 return None;
             }
         };
         let h = hash(&raw);
         if h == self.last_hash {
             if self.last_change.elapsed() > STALE_AFTER {
-                // writer died or never started — (re)acquire a feed
+                // static content — dead marker for the UI either way,
+                // but only hunt for a new writer outside the warm-up
+                // grace (a just-spawned helper is still initializing)
                 self.alive = false;
-                self.ensure();
+                if !self.in_spawn_grace() {
+                    self.ensure();
+                }
                 self.last_change = Instant::now();
             }
             return None;
         }
         let n = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
         if n == 0 || n + 4 > raw.len() {
+            // zero-filled / truncated bin — record the hash so the SAME
+            // static content registers as stale next poll; without this
+            // a never-writing helper's zeros would never trip the
+            // watchdog (h != last_hash forever → ensure() unreachable)
+            self.last_hash = h;
             return None;
         }
         let parsed: BinFile = match serde_json::from_slice(&raw[4..4 + n]) {
@@ -445,6 +501,43 @@ fn hash(b: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     b.hash(&mut h);
     h.finish()
+}
+
+// ---- single sensor-writer across OcyDash processes --------------------
+// Headless AND the editor each run a feed — but only ONE may own the
+// SystemInfos helper (it writes a single shared bin every process reads).
+// The owner holds Local\OcyDashSensorWriter for its lifetime; readers
+// retry the claim each dead-feed cycle and get promoted when the owner
+// exits (the wait returns WAIT_ABANDONED).
+
+static WRITER_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn writer_mutex() -> usize {
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    *WRITER_MUTEX.get_or_init(|| unsafe {
+        let name: Vec<u16> = "Local\\OcyDashSensorWriter\0"
+            .encode_utf16()
+            .collect();
+        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if h.is_null() {
+            0
+        } else {
+            h as usize
+        }
+    })
+}
+
+/// Try to claim the writer role. Returns true immediately for the owner
+/// (recursive re-acquire is fine), false for readers while a live owner
+/// holds it, true again after the owner dies (abandoned mutex).
+fn claim_writer() -> bool {
+    use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let h = writer_mutex();
+    if h == 0 {
+        return true; // mutex unavailable — act as writer (safe default)
+    }
+    unsafe { matches!(WaitForSingleObject(h as _, 0), WAIT_OBJECT_0 | WAIT_ABANDONED) }
 }
 
 /// A writer is alive if the embedded `systemTime` field advances within a
