@@ -86,6 +86,19 @@ every few seconds (the real "frozen values" root cause). Readers adopt
 the shared bin only; claim retried on each dead feed so the survivor
 promotes when the owner exits.
 
+HWiNFO_214 is SINGLE-CLIENT: contended helper instances stall in GPU
+enumeration and write a 64KB all-zero bin forever (verified: 3 concurrent
+helpers → all zeros; `SensorProbe.exe` debug console stalls at the AMD
+`VEN_1002` PCI query). Defenses: zero-bins DO trip staleness (last_hash
+recorded on the n==0 early-return — without it the watchdog could never
+fire on a never-writing helper), 1.5s settle sleep after `taskkill`
+before respawn so the dying helper releases the driver slot, stale bin
+deleted on respawn (no flash of dead values), missing-bin rescan
+throttled to 2s.
+
+Feed events append to `%APPDATA%\ocydash\sensors.log` (`slog()`) — the
+production diagnostic channel for the windowless build.
+
 ## Build / run
 
 ```sh
