@@ -1,3 +1,6 @@
+<img width="3834" height="1986" alt="Screenshot 2026-11-04 213950" src="https://github.com/user-attachments/assets/7a84a6a8-d05f-4cb6-b0e4-9f41c62b9db4" />
+<img width="1833" height="93" alt="Screenshot 2026-11-04 215920" src="https://github.com/user-attachments/assets/40f73585-74a4-4d77-a63e-fd1e36cd6c6c" />
+
 # OcyDash: The Ultimate Custom Driver for Ocypus AIO Coolers
 
 A highly optimized, ultra-lightweight custom driver and UI dashboard built in
