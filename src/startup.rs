@@ -12,12 +12,12 @@ const VALUE_NAME: &str = "OcyDash";
 
 fn schtasks(args: &[&str]) -> Result<bool, String> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("schtasks")
+    // absolute System32 path — name-only resolution searches CWD/PATH,
+    // and a planted schtasks.exe would run elevated
+    std::process::Command::new(crate::deps::system32("schtasks.exe"))
         .args(args)
         // console tool — no flashing window from the GUI/headless parent
-        .creation_flags(
-            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
-        )
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -25,9 +25,23 @@ fn schtasks(args: &[&str]) -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Task exists → autostart is on.
+/// Task exists AND is not Disabled → autostart is on. A bare /query
+/// succeeds for disabled tasks too, so parse the CSV status column.
 pub fn is_enabled() -> bool {
-    schtasks(&["/query", "/tn", TASK_NAME]).unwrap_or(false)
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new(crate::deps::system32("schtasks.exe"))
+        .args(["/query", "/tn", TASK_NAME, "/fo", "csv", "/nh"])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            !s.contains("Disabled")
+        }
+        _ => false,
+    }
 }
 
 pub fn set(enabled: bool) -> Result<(), String> {
@@ -43,7 +57,13 @@ pub fn set(enabled: bool) -> Result<(), String> {
         // "works manually, frozen after reboot" bug appears.
         let ru = runas_principal();
         let mut args = vec![
-            "/create", "/tn", TASK_NAME, "/tr", tr.as_str(), "/sc", "onlogon",
+            "/create",
+            "/tn",
+            TASK_NAME,
+            "/tr",
+            tr.as_str(),
+            "/sc",
+            "onlogon",
         ];
         if !ru.is_empty() {
             args.extend(["/ru", ru.as_str(), "/it"]);

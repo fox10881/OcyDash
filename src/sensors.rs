@@ -13,8 +13,8 @@ use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,10 @@ const HELPER_DIR: &str =
     r"C:\Program Files\Ocypus Display\resources\main\SDK\VC#\SystemInfos\vs2008\bin\x64\Release";
 const HELPER_EXE: &str = "SystemInfos.exe";
 const OUR_NAME: &str = "OcypusRust";
+/// The only feed filename we ever adopt — matches `{OUR_NAME}.bin`.
+/// Foreign `Ocypus*.bin` writers (official app, probes) are ignored so a
+/// planted same-user fake can't impersonate a sensor source.
+const OUR_BIN: &str = "OcypusRust.bin";
 /// Feed is dead when its content hash stays static this long.
 const STALE_AFTER: Duration = Duration::from_secs(5);
 /// A spawned helper is untouchable for this long — covers HWiNFO
@@ -368,7 +372,9 @@ impl SensorFeed {
                     self.note_live();
                     return;
                 }
-                Err(e) => slog(&format!("native hwinfo init failed ({e}) — helper fallback")),
+                Err(e) => slog(&format!(
+                    "native hwinfo init failed ({e}) — helper fallback"
+                )),
             }
         }
         self.spawn();
@@ -432,13 +438,16 @@ impl SensorFeed {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             // SystemInfos.exe is console-subsystem — never show its window
-            .creation_flags(
-                windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
-            )
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .spawn()
         {
             Ok(c) => {
-                slog(&format!("spawned {} pid={} cwd={}", exe.display(), c.id(), dir.display()));
+                slog(&format!(
+                    "spawned {} pid={} cwd={}",
+                    exe.display(),
+                    c.id(),
+                    dir.display()
+                ));
                 crate::job::protect(c.id()); // reap even on taskkill /F
                 self.child = Some(c);
             }
@@ -446,24 +455,26 @@ impl SensorFeed {
                 // ERROR_ELEVATION_REQUIRED (740): the exe manifest demands
                 // admin. Delegate to `Start-Process` — the UAC prompt is
                 // raised automatically by the exe's manifest. No wait.
-                slog(&format!("normal spawn failed ({e}); elevating via Start-Process"));
+                slog(&format!(
+                    "normal spawn failed ({e}); elevating via Start-Process"
+                ));
                 let ps = format!(
                     "$env:TEMP='{}'; $env:TMP='{}'; Start-Process -FilePath '{}' -ArgumentList '{}','1800','0' -WorkingDirectory '{}' -WindowStyle Hidden",
-                    temp.display(),
-                    temp.display(),
-                    exe.display(),
+                    crate::deps::ps_quote(&temp.display().to_string()),
+                    crate::deps::ps_quote(&temp.display().to_string()),
+                    crate::deps::ps_quote(&exe.display().to_string()),
                     OUR_NAME,
-                    dir.display()
+                    crate::deps::ps_quote(&dir.display().to_string())
                 );
-                match Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &ps])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .creation_flags(
-                        windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
-                    )
-                    .spawn()
+                match Command::new(crate::deps::system32(
+                    r"WindowsPowerShell\v1.0\powershell.exe",
+                ))
+                .args(["-NoProfile", "-Command", &ps])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                .spawn()
                 {
                     Ok(_) => slog("elevated spawn requested (UAC may appear)"),
                     Err(e2) => slog(&format!("elevated spawn failed: {e2}")),
@@ -474,8 +485,10 @@ impl SensorFeed {
 
     /// Poll the bin file; returns Some(sample) only when content changed.
     pub fn poll(&mut self) -> Option<SysSample> {
-        // native producer: refresh OUR bin ~1/s, then let the normal
-        // parse path below publish it (identical for remote readers)
+        // native producer: refresh OUR bin ~1.4s and publish the parsed
+        // sample DIRECTLY — never re-reads the %TEMP% file it just wrote
+        // (a same-user non-admin process could tamper/replace it). The
+        // file is still emitted for external readers.
         if let Some(hw) = self.native.as_mut() {
             if self.last_native_write.elapsed() >= Duration::from_millis(1400) {
                 self.last_native_write = Instant::now();
@@ -487,12 +500,31 @@ impl SensorFeed {
                     self.alive = false;
                     return None;
                 }
-                write_native_bin(rs, &self.bin_path);
+                if let Some(s) = write_native_bin(rs, &self.bin_path) {
+                    self.last_sample = s.clone();
+                    self.last_change = Instant::now();
+                    self.seeded = true;
+                    self.alive = true;
+                    self.note_live();
+                    return Some(s);
+                }
             }
+            // between publishes the owner is self-sufficient — don't fall
+            // through to the file path at all
+            return None;
         }
-        let raw = fs::read(&self.bin_path).ok();
+        // real bins are a fixed 64KiB mmap — check the SIZE METADATA
+        // before reading so a planted multi-GB fake never allocates
+        let too_big = fs::metadata(&self.bin_path)
+            .map(|m| m.len() > 128 * 1024)
+            .unwrap_or(false);
+        let raw = if too_big {
+            None
+        } else {
+            fs::read(&self.bin_path).ok()
+        };
         let raw = match raw {
-            Some(r) if r.len() >= 4 => r,
+            Some(r) if r.len() >= 4 && r.len() <= 128 * 1024 => r,
             _ => {
                 // file missing entirely -> feed dead; rescan/adopt at
                 // most every 2s (last_change doubles as the ensure clock
@@ -564,7 +596,6 @@ impl SensorFeed {
         self.last_sample = extract(&parsed);
         Some(self.last_sample.clone())
     }
-
 }
 
 /// Shared state published by the background sensor thread.
@@ -644,15 +675,17 @@ static WRITER_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 fn writer_mutex() -> usize {
     use windows_sys::Win32::System::Threading::CreateMutexW;
     *WRITER_MUTEX.get_or_init(|| unsafe {
-        let name: Vec<u16> = "Local\\OcyDashSensorWriter\0"
-            .encode_utf16()
-            .collect();
-        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        if h.is_null() {
-            0
-        } else {
-            h as usize
-        }
+        // Global\ — creating objects there requires SeCreateGlobalPrivilege
+        // (admins/services only), so a NON-admin same-session process can
+        // never squat this name to DoS the writer role. Local\ names are
+        // open to every process in the session.
+        let name: Vec<u16> = "Global\\OcyDashSensorWriter\0".encode_utf16().collect();
+        // bInitialOwner=1 — an atomically-owned create closes the race
+        // between CreateMutex and the first WaitForSingleObject(0),
+        // during which another same-user process could acquire first
+        // and squat the writer role forever
+        let h = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
+        if h.is_null() { 0 } else { h as usize }
     })
 }
 
@@ -664,9 +697,17 @@ fn claim_writer() -> bool {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     let h = writer_mutex();
     if h == 0 {
-        return true; // mutex unavailable — act as writer (safe default)
+        // fail CLOSED: acting as writer with no arbitration could put
+        // two clients on the single-client HWiNFO driver — that's the
+        // exact contention wedge this mutex exists to prevent
+        return false;
     }
-    unsafe { matches!(WaitForSingleObject(h as _, 0), WAIT_OBJECT_0 | WAIT_ABANDONED) }
+    unsafe {
+        matches!(
+            WaitForSingleObject(h as _, 0),
+            WAIT_OBJECT_0 | WAIT_ABANDONED
+        )
+    }
 }
 
 /// A writer is alive if the embedded `systemTime` field advances within a
@@ -685,6 +726,14 @@ fn bin_alive(path: &PathBuf) -> bool {
 }
 
 fn read_system_time(path: &PathBuf) -> Option<String> {
+    // size-gate before reading — a planted giant bin must not be
+    // slurped once per liveness probe per candidate
+    if fs::metadata(path)
+        .map(|m| m.len() > 128 * 1024)
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let raw = fs::read(path).ok()?;
     if raw.len() < 4 {
         return None;
@@ -726,10 +775,16 @@ fn pick_fan(list: &[SensorEntry], suffix: &str) -> f64 {
 /// Best-effort pump detection: name containing "pump", then "system",
 /// else the fastest mb header that isn't the CPU fan (pumps spin ~3-8k).
 fn pick_pump(list: &[SensorEntry]) -> f64 {
-    if let Some(e) = list.iter().find(|e| e.sensorname.to_lowercase().contains("pump")) {
+    if let Some(e) = list
+        .iter()
+        .find(|e| e.sensorname.to_lowercase().contains("pump"))
+    {
         return num(&e.value);
     }
-    if let Some(e) = list.iter().find(|e| e.sensorname.to_lowercase().contains("system")) {
+    if let Some(e) = list
+        .iter()
+        .find(|e| e.sensorname.to_lowercase().contains("system"))
+    {
         return num(&e.value);
     }
     list.iter()
@@ -757,7 +812,11 @@ fn extract(b: &BinFile) -> SysSample {
         gpu_power: pick(&gpu.power_draw_list, "GPU"),
         cpu_fan: pick_fan(&cpu.fan_speed_list, ": CPU"),
         pump_fan: pick_pump(&cpu.fan_speed_list),
-        gpu_fan: gpu.fan_speed_list.first().map(|e| num(&e.value)).unwrap_or(0.0),
+        gpu_fan: gpu
+            .fan_speed_list
+            .first()
+            .map(|e| num(&e.value))
+            .unwrap_or(0.0),
         cpu_name: cpu.name_list.first().map(text_of).unwrap_or_default(),
         gpu_name: gpu.name_list.first().map(text_of).unwrap_or_default(),
         ram_total: b.mem.total,
@@ -798,7 +857,12 @@ fn extract(b: &BinFile) -> SysSample {
 /// helper wrote, then emit `OcypusRust.bin` = [u32 LE len][utf8 json].
 /// Every OcyDash process (headless + editor) keeps parsing the same
 /// contract — only the producer changed.
-fn write_native_bin(rs: &[crate::hwinfo::Reading], path: &PathBuf) {
+/// Emit the helper-schema bin AND return the parsed sample so the native
+/// owner can publish without re-reading the file — %TEMP% is writable by
+/// any same-user (non-admin) process, so trusting the file we just wrote
+/// leaves a tamper/replace window on every poll. The file still lands on
+/// disk for external readers (the editor process adopts it).
+fn write_native_bin(rs: &[crate::hwinfo::Reading], path: &PathBuf) -> Option<SysSample> {
     use crate::hwinfo as hw;
     use serde_json::json;
 
@@ -877,7 +941,11 @@ fn write_native_bin(rs: &[crate::hwinfo::Reading], path: &PathBuf) {
 
     let entry = |n: &str, v: f64| json!({"sensorname": n, "value": v, "checked": false});
     let names = |v: Vec<String>| -> serde_json::Value {
-        json!(v.iter().map(|n| json!({"sensorname": n, "value": n, "checked": false})).collect::<Vec<_>>())
+        json!(
+            v.iter()
+                .map(|n| json!({"sensorname": n, "value": n, "checked": false}))
+                .collect::<Vec<_>>()
+        )
     };
     let body = json!({
         "cpuLayout": {
@@ -908,6 +976,11 @@ fn write_native_bin(rs: &[crate::hwinfo::Reading], path: &PathBuf) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&bytes);
     let _ = fs::write(path, out);
+    // re-parse the same Value through the identical schema → zero drift
+    // between what readers see on disk and what we publish directly
+    serde_json::from_value::<BinFile>(body)
+        .ok()
+        .map(|b| extract(&b))
 }
 
 /// The interactive user's temp dir — forced onto spawned helpers via
@@ -928,7 +1001,9 @@ fn bin_path(name: &str) -> PathBuf {
 /// production (spawns, adoptions, recoveries, transitions).
 pub(crate) fn slog(msg: &str) {
     eprintln!("[sensors] {msg}");
-    let Ok(ap) = std::env::var("APPDATA") else { return };
+    let Ok(ap) = std::env::var("APPDATA") else {
+        return;
+    };
     let dir = PathBuf::from(ap).join("ocydash");
     let _ = fs::create_dir_all(&dir);
     let line = format!("{} {msg}\n", chrono::Local::now().format("%H:%M:%S"));
@@ -968,7 +1043,7 @@ const HELPER_IMAGES: [&str; 2] = ["SystemInfos.exe", "SensorProbe.exe"];
 /// the driver-protected process).
 fn kill_helpers() {
     for image in HELPER_IMAGES {
-        let _ = Command::new("taskkill")
+        let _ = Command::new(crate::deps::system32("taskkill.exe"))
             .args(["/F", "/T", "/IM", image])
             .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .stdout(Stdio::null())
@@ -995,10 +1070,7 @@ fn purge_field() {
             let p = e.path();
             let stale = p
                 .file_name()
-                .map(|n| {
-                    let s = n.to_string_lossy();
-                    s.starts_with("Ocypus") && s.ends_with(".bin")
-                })
+                .map(|n| n.to_string_lossy() == OUR_BIN)
                 .unwrap_or(false);
             if stale {
                 let _ = fs::remove_file(&p);
@@ -1021,35 +1093,43 @@ fn escalate_recovery() {
     slog("STALL ESCALATION: restarting display adapters + HWiNFO driver");
     // restart display adapters — wakes D3-stuck iGPUs and re-runs a
     // wedged vendor driver stack (screen may flicker once)
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | \
-             ForEach-Object { pnputil /restart-device $_.InstanceId }",
-        ])
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // tools resolved via GetSystemDirectoryW — $env:SystemRoot can be
+    // shadowed by a user-level HKCU\Environment value, which would let a
+    // planted pnputil.exe/sc.exe run ELEVATED inside this PS context
+    let pnputil = crate::deps::ps_quote(&crate::deps::system32("pnputil.exe").to_string_lossy());
+    let ps = format!(
+        "Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | \
+         ForEach-Object {{ & '{pnputil}' /restart-device $_.InstanceId }}"
+    );
+    let _ = Command::new(crate::deps::system32(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args(["-NoProfile", "-Command", &ps])
+    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status();
     // restart the HWiNFO kernel driver (service name is versioned —
     // HWiNFO_214 etc. — so resolve it dynamically); a live client must
     // be dead first or the service pins in STOP_PENDING
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_SystemDriver -Filter \"Name like 'HWiNFO%'\" \
-             | Where-Object {$_.State -eq 'Running'} | ForEach-Object { \
-             sc.exe stop $_.Name | Out-Null; Start-Sleep 3; \
-             sc.exe start $_.Name | Out-Null }",
-        ])
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let sc = crate::deps::ps_quote(&crate::deps::system32("sc.exe").to_string_lossy());
+    let ps = format!(
+        "$sc = '{sc}'; \
+         Get-CimInstance Win32_SystemDriver -Filter \"Name like 'HWiNFO%'\" \
+         | Where-Object {{$_.State -eq 'Running'}} | ForEach-Object {{ \
+         & $sc stop $_.Name | Out-Null; Start-Sleep 3; \
+         & $sc start $_.Name | Out-Null }}"
+    );
+    let _ = Command::new(crate::deps::system32(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args(["-NoProfile", "-Command", &ps])
+    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status();
     slog("escalation done — respawning on reset field");
 }
 
@@ -1073,13 +1153,15 @@ pub fn startup_cleanup() {
          Where-Object {{ $_.Id -ne {me} -and $s -ne $null -and \
          $_.StartTime -lt $s.StartTime }} | Stop-Process -Force"
     );
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps])
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = Command::new(crate::deps::system32(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args(["-NoProfile", "-Command", &ps])
+    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status();
     kill_helpers();
 }
 
@@ -1092,9 +1174,7 @@ fn temp_roots() -> Vec<PathBuf> {
     if let Ok(up) = std::env::var("USERPROFILE") {
         roots.push(PathBuf::from(up).join(r"AppData\Local\Temp"));
     }
-    if let (Ok(drive), Ok(user)) =
-        (std::env::var("SystemDrive"), std::env::var("USERNAME"))
-    {
+    if let (Ok(drive), Ok(user)) = (std::env::var("SystemDrive"), std::env::var("USERNAME")) {
         roots.push(
             PathBuf::from(drive)
                 .join("Users")
@@ -1125,12 +1205,13 @@ fn bin_candidates() -> Vec<PathBuf> {
         if let Ok(rd) = fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
+                // adopt ONLY our exact bin name — a `Ocypus*` glob lets a
+                // same-user process plant `OcypusFake.bin` (ticking
+                // systemTime is easy to fake) and feed forged sensor
+                // values to the LCD. Our writer always emits OUR_BIN.
                 let is_bin = p
                     .file_name()
-                    .map(|n| {
-                        let s = n.to_string_lossy();
-                        s.starts_with("Ocypus") && s.ends_with(".bin")
-                    })
+                    .map(|n| n.to_string_lossy() == OUR_BIN)
                     .unwrap_or(false);
                 if is_bin && !out.contains(&p) {
                     out.push(p);

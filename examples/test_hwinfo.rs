@@ -27,21 +27,25 @@ struct SensorReadResult {
     value: f64,
     units: [u8; 32],
     // SENSOR_INFO
-    sensor_loc: u32,      // ESENSOR_LOCATION
+    sensor_loc: u32, // ESENSOR_LOCATION
     sensor_loc2: u32,
     loc_index: i32,
     loc_name: [u8; 128],
     loc_name2: [u8; 128],
-    reading_loc: u32,     // EREADING_LOCATION
+    reading_loc: u32, // EREADING_LOCATION
     rloc_index: i32,
     rloc_index2: i32,
     rloc_name: [u8; 128],
-    rtype: u32,           // EREADING_TYPE
-    rsubtype: u32,        // union subtype (eOtherType etc.)
+    rtype: u32,    // EREADING_TYPE
+    rsubtype: u32, // union subtype (eOtherType etc.)
 }
 
 fn sym(h: *mut c_void, ord: u32) -> *mut c_void {
-    unsafe { GetProcAddress(h, ord as *const u8).map(|f| f as *mut c_void).unwrap_or(std::ptr::null_mut()) }
+    unsafe {
+        GetProcAddress(h, ord as *const u8)
+            .map(|f| f as *mut c_void)
+            .unwrap_or(std::ptr::null_mut())
+    }
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -104,7 +108,10 @@ fn main() {
                 }
             }
             let ms = t0.elapsed().as_millis();
-            println!("20 sweeps x {hits} readings: {ms}ms total, {:.1}ms/sweep", ms as f64 / 20.0);
+            println!(
+                "20 sweeps x {hits} readings: {ms}ms total, {:.1}ms/sweep",
+                ms as f64 / 20.0
+            );
             return;
         }
         if only_type == 97 {
@@ -146,29 +153,38 @@ fn main() {
                 for ty in 1u32..=8 {
                     for idx in 0..128 {
                         let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
-                        if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0 {
+                        if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0
+                        {
                             valid.push((i, ty, idx));
                             any = true;
                         }
                     }
                 }
-                if any { sensors.push(i); }
+                if any {
+                    sensors.push(i);
+                }
             }
             println!("{} valid slots on {} sensors", valid.len(), sensors.len());
             for rounds in [50usize] {
                 let t0 = std::time::Instant::now();
                 let mut hits = 0;
                 for _ in 0..rounds {
-                    for &s in &sensors { read(s); }
+                    for &s in &sensors {
+                        read(s);
+                    }
                     for &(i, ty, idx) in &valid {
                         let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
-                        if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0 {
+                        if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0
+                        {
                             hits += 1;
                         }
                     }
                 }
                 let ms = t0.elapsed().as_millis() as f64;
-                println!("{rounds} collects x {hits} reads: {ms:.0}ms total = {:.2}ms/collect", ms / rounds as f64);
+                println!(
+                    "{rounds} collects x {hits} reads: {ms:.0}ms total = {:.2}ms/collect",
+                    ms / rounds as f64
+                );
             }
             return;
         }

@@ -3,17 +3,15 @@
 
 use crate::background::BgEngine;
 use crate::display::{EngineHandle, EngineStats};
-use crate::render::{rotate_rgba, Renderer};
+use crate::render::{Renderer, rotate_rgba};
 use crate::sensors::{SensorHandle, SysSample};
-use crate::theme::{
-    list_themes, themes_dir, Align, Background, Theme, Widget, WidgetKind,
-};
+use crate::theme::{Align, Background, Theme, Widget, WidgetKind, list_themes, themes_dir};
 use crate::theme::{CANVAS_H, CANVAS_W};
 use chrono::Timelike;
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions, Vec2};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const IMG_FILT: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
@@ -83,12 +81,14 @@ fn zone_of(w: &crate::theme::Widget, cx: f32, cy: f32, hz: f32) -> Option<Zone> 
 /// font so PUA icon glyphs render instead of missing-char boxes.
 fn register_icon_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    for cand in [r"C:\Windows\Fonts\segmdl2.ttf", r"C:\Windows\Fonts\seguisym.ttf"] {
+    for cand in [
+        r"C:\Windows\Fonts\segmdl2.ttf",
+        r"C:\Windows\Fonts\seguisym.ttf",
+    ] {
         if let Ok(bytes) = std::fs::read(cand) {
-            fonts.font_data.insert(
-                "icons".into(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
+            fonts
+                .font_data
+                .insert("icons".into(), Arc::new(egui::FontData::from_owned(bytes)));
             fonts
                 .families
                 .get_mut(&egui::FontFamily::Proportional)
@@ -139,10 +139,10 @@ impl EditorApp {
         // restore last-used theme if present
         let mut theme = Theme::default();
         let files = list_themes();
-        if let Some(last) = last_theme_file() {
-            if let Some(t) = Theme::load(&last) {
-                theme = t;
-            }
+        if let Some(last) = last_theme_file()
+            && let Some(t) = Theme::load(&last)
+        {
+            theme = t;
         }
         let (cw, ch) = theme.canvas_size();
         let mut bg = BgEngine::new(cw, ch);
@@ -269,103 +269,107 @@ impl EditorApp {
             .frame(egui::Frame::side_top_panel(ui.style()))
             .resizable(false)
             .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("OcyDash").strong());
-                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.heading(RichText::new("OcyDash").strong());
+                    ui.separator();
 
-                ui.label("Theme:");
-                let name_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.theme.name).desired_width(120.0),
-                );
-                if name_resp.changed() {
-                    self.mark_dirty();
-                }
-                egui::ComboBox::from_id_salt("theme_pick")
-                    .selected_text(if self.theme_pick.is_empty() {
-                        "load…".to_string()
-                    } else {
-                        self.theme_pick.clone()
-                    })
-                    .show_ui(ui, |ui| {
-                        let mut picked = None;
-                        for p in &self.theme_files {
-                            let n = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                            if ui.selectable_label(false, &n).clicked() {
-                                picked = Some((p.clone(), n));
-                            }
-                        }
-                        if let Some((pp, n)) = picked {
-                            self.load_theme(&pp);
-                            self.theme_pick = n;
-                        }
-                    });
-                if ui.button(ICON_REFRESH).on_hover_text("Rescan theme folder").clicked() {
-                    self.theme_files = list_themes();
-                }
-                if ui.button("Save").clicked() {
-                    if let Err(e) = self.theme.save() {
-                        self.status = format!("save failed: {e}");
-                    } else {
-                        self.status = format!("saved {}", self.theme.name);
-                        self.theme_files = list_themes();
+                    ui.label("Theme:");
+                    let name_resp = ui
+                        .add(egui::TextEdit::singleline(&mut self.theme.name).desired_width(120.0));
+                    if name_resp.changed() {
+                        self.mark_dirty();
                     }
-                }
-                if ui.button("New").clicked() {
-                    let _ = self.theme.save();
-                    let name = format!("{} copy", self.theme.name);
-                    self.theme = Theme::default();
-                    self.theme.name = name;
-                    self.renderer.resize(CANVAS_W, CANVAS_H);
-                    self.bg = BgEngine::new(CANVAS_W, CANVAS_H);
-                    self.bg.set(&self.theme.background);
-                    self.selected = None;
-                    self.drag_mode = None;
-                    self.mark_dirty();
-                }
-
-                if ui
-                    .button(ICON_FOLDER)
-                    .on_hover_text("Open themes folder")
-                    .clicked()
-                {
-                    let _ = std::process::Command::new("explorer")
-                        .arg(themes_dir())
-                        .spawn();
-                }
-
-                ui.separator();
-                ui.label("Rotate:");
-                for d in [0u16, 90, 180, 270] {
+                    egui::ComboBox::from_id_salt("theme_pick")
+                        .selected_text(if self.theme_pick.is_empty() {
+                            "load…".to_string()
+                        } else {
+                            self.theme_pick.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            let mut picked = None;
+                            for p in &self.theme_files {
+                                let n = p
+                                    .file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
+                                if ui.selectable_label(false, &n).clicked() {
+                                    picked = Some((p.clone(), n));
+                                }
+                            }
+                            if let Some((pp, n)) = picked {
+                                self.load_theme(&pp);
+                                self.theme_pick = n;
+                            }
+                        });
                     if ui
-                        .selectable_label(self.theme.rotation == d, format!("{d}°"))
+                        .button(ICON_REFRESH)
+                        .on_hover_text("Rescan theme folder")
                         .clicked()
                     {
-                        self.apply_rotation(d);
+                        self.theme_files = list_themes();
                     }
-                }
-
-                // right-aligned: HKCU Run-key toggle for the headless service
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .checkbox(&mut self.autorun, "Run on startup")
-                        .changed()
-                    {
-                        match crate::startup::set(self.autorun) {
-                            Ok(()) => {
-                                self.status = format!(
-                                    "startup {}",
-                                    if self.autorun { "enabled" } else { "disabled" }
-                                );
-                            }
-                            Err(e) => {
-                                self.autorun = !self.autorun;
-                                self.status = format!("startup failed: {e}");
-                            }
+                    if ui.button("Save").clicked() {
+                        if let Err(e) = self.theme.save() {
+                            self.status = format!("save failed: {e}");
+                        } else {
+                            self.status = format!("saved {}", self.theme.name);
+                            self.theme_files = list_themes();
                         }
                     }
+                    if ui.button("New").clicked() {
+                        let _ = self.theme.save();
+                        let name = format!("{} copy", self.theme.name);
+                        self.theme = Theme::default();
+                        self.theme.name = name;
+                        self.renderer.resize(CANVAS_W, CANVAS_H);
+                        self.bg = BgEngine::new(CANVAS_W, CANVAS_H);
+                        self.bg.set(&self.theme.background);
+                        self.selected = None;
+                        self.drag_mode = None;
+                        self.mark_dirty();
+                    }
+
+                    if ui
+                        .button(ICON_FOLDER)
+                        .on_hover_text("Open themes folder")
+                        .clicked()
+                    {
+                        let _ = std::process::Command::new(crate::deps::windir("explorer.exe"))
+                            .arg(themes_dir())
+                            .spawn();
+                    }
+
+                    ui.separator();
+                    ui.label("Rotate:");
+                    for d in [0u16, 90, 180, 270] {
+                        if ui
+                            .selectable_label(self.theme.rotation == d, format!("{d}°"))
+                            .clicked()
+                        {
+                            self.apply_rotation(d);
+                        }
+                    }
+
+                    // right-aligned: HKCU Run-key toggle for the headless service
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.checkbox(&mut self.autorun, "Run on startup").changed() {
+                            match crate::startup::set(self.autorun) {
+                                Ok(()) => {
+                                    self.status = format!(
+                                        "startup {}",
+                                        if self.autorun { "enabled" } else { "disabled" }
+                                    );
+                                }
+                                Err(e) => {
+                                    self.autorun = !self.autorun;
+                                    self.status = format!("startup failed: {e}");
+                                }
+                            }
+                        }
+                    });
                 });
             });
-        });
     }
 
     fn left_panel(&mut self, ui: &mut egui::Ui) {
@@ -387,21 +391,25 @@ impl EditorApp {
                     }
                 }
                 let is_img = matches!(self.theme.background, Background::Image { .. });
-                if ui.selectable_label(is_img, "Image / GIF").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("image", IMG_FILT).pick_file() {
-                        self.set_background(Background::Image {
-                            path: p.to_string_lossy().into(),
-                        });
-                    }
+                if ui.selectable_label(is_img, "Image / GIF").clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("image", IMG_FILT)
+                        .pick_file()
+                {
+                    self.set_background(Background::Image {
+                        path: p.to_string_lossy().into(),
+                    });
                 }
                 let is_vid = matches!(self.theme.background, Background::Video { .. });
-                if ui.selectable_label(is_vid, "Video").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("video", VID_FILT).pick_file() {
-                        self.set_background(Background::Video {
-                            path: p.to_string_lossy().into(),
-                            fps: 15,
-                        });
-                    }
+                if ui.selectable_label(is_vid, "Video").clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("video", VID_FILT)
+                        .pick_file()
+                {
+                    self.set_background(Background::Video {
+                        path: p.to_string_lossy().into(),
+                        fps: 15,
+                    });
                 }
 
                 // file/fps editors for current bg (no &mut self inside match)
@@ -409,12 +417,14 @@ impl EditorApp {
                 match &mut self.theme.background {
                     Background::Image { path } => {
                         ui.horizontal(|ui| {
-                            if ui.button("…").on_hover_text("change file").clicked() {
-                                if let Some(p) = rfd::FileDialog::new().add_filter("image", IMG_FILT).pick_file() {
-                                    pending = Some(Background::Image {
-                                        path: p.to_string_lossy().into(),
-                                    });
-                                }
+                            if ui.button("…").on_hover_text("change file").clicked()
+                                && let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("image", IMG_FILT)
+                                    .pick_file()
+                            {
+                                pending = Some(Background::Image {
+                                    path: p.to_string_lossy().into(),
+                                });
                             }
                             ui.small(short_path(path));
                         });
@@ -423,10 +433,12 @@ impl EditorApp {
                         let mut f = *fps;
                         let mut fpath = None;
                         ui.horizontal(|ui| {
-                            if ui.button("…").on_hover_text("change file").clicked() {
-                                if let Some(p) = rfd::FileDialog::new().add_filter("video", VID_FILT).pick_file() {
-                                    fpath = Some(p.to_string_lossy().into_owned());
-                                }
+                            if ui.button("…").on_hover_text("change file").clicked()
+                                && let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("video", VID_FILT)
+                                    .pick_file()
+                            {
+                                fpath = Some(p.to_string_lossy().into_owned());
                             }
                             ui.small(short_path(path));
                         });
@@ -483,10 +495,8 @@ impl EditorApp {
                     ui.horizontal(|ui| {
                         // fixed-size row rect — selection painted manually so
                         // text stays left-aligned (Button centres its text)
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(LABEL_W, ROW_H),
-                            egui::Sense::click(),
-                        );
+                        let (rect, resp) = ui
+                            .allocate_exact_size(egui::vec2(LABEL_W, ROW_H), egui::Sense::click());
                         let radius = egui::CornerRadius::same(4);
                         if sel {
                             let v = &ui.visuals().selection;
@@ -531,7 +541,11 @@ impl EditorApp {
                     });
                 }
                 if let Some(id) = sel_toggle {
-                    self.selected = if self.selected == Some(id) { None } else { Some(id) };
+                    self.selected = if self.selected == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
                 }
                 if let Some(id) = to_delete {
                     self.theme.widgets.retain(|w| w.id != id);
@@ -591,7 +605,10 @@ impl EditorApp {
                             .selected_text(format!("{:?}", w.align))
                             .show_ui(ui, |ui| {
                                 for a in [Align::Left, Align::Center, Align::Right] {
-                                    if ui.selectable_label(w.align == a, format!("{a:?}")).clicked() {
+                                    if ui
+                                        .selectable_label(w.align == a, format!("{a:?}"))
+                                        .clicked()
+                                    {
                                         w.align = a;
                                         ch = true;
                                     }
@@ -613,9 +630,7 @@ impl EditorApp {
                         WidgetKind::CpuName | WidgetKind::GpuName => {
                             ui.horizontal(|ui| {
                                 ui.label("label:");
-                                ch |= ui
-                                    .text_edit_singleline(&mut w.text_override)
-                                    .changed();
+                                ch |= ui.text_edit_singleline(&mut w.text_override).changed();
                                 if ui.small_button("reset").clicked() {
                                     w.text_override.clear();
                                     ch = true;
@@ -643,10 +658,7 @@ impl EditorApp {
                             egui::ComboBox::from_id_salt(("sensor_pick", w.id))
                                 .selected_text(sel)
                                 .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(w.sensor_idx == 0, "Auto")
-                                        .clicked()
-                                    {
+                                    if ui.selectable_label(w.sensor_idx == 0, "Auto").clicked() {
                                         w.sensor_idx = 0;
                                         ch = true;
                                     }
@@ -715,204 +727,216 @@ impl EditorApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()))
             .show(ui, |ui| {
-            let avail = ui.available_size();
-            let (cw, ch) = (self.renderer.w as f32, self.renderer.h as f32);
-            let scale = (avail.x / cw).min(avail.y / ch).min(2.0).max(0.25);
-            let size = Vec2::new(cw * scale, ch * scale);
-            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let avail = ui.available_size();
+                let (cw, ch) = (self.renderer.w as f32, self.renderer.h as f32);
+                let scale = (avail.x / cw).min(avail.y / ch).min(2.0).max(0.25);
+                let size = Vec2::new(cw * scale, ch * scale);
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
 
-            if let Some(tex) = &self.preview {
-                ui.painter().image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            } else {
-                ui.painter().rect_filled(rect, 4.0, Color32::BLACK);
-            }
-
-            // widget outlines — always in un-rotated user space
-            const DOT: f32 = 5.0; // handle dot size (screen px)
-            let dot_pos = |r: egui::Rect, z: Zone| -> egui::Pos2 {
-                match z {
-                    Zone::NW => r.left_top(),
-                    Zone::N => r.center_top(),
-                    Zone::NE => r.right_top(),
-                    Zone::E => r.right_center(),
-                    Zone::SE => r.right_bottom(),
-                    Zone::S => r.center_bottom(),
-                    Zone::SW => r.left_bottom(),
-                    Zone::W => r.left_center(),
-                    Zone::Interior => r.center(),
-                }
-            };
-            for w in &self.theme.widgets {
-                let r = egui::Rect::from_min_size(
-                    rect.min + Vec2::new(w.x * scale, w.y * scale),
-                    Vec2::new(w.w * scale, w.h * scale),
-                );
-                let sel = self.selected == Some(w.id);
-                let col = if sel {
-                    Color32::from_rgb(90, 200, 250)
+                if let Some(tex) = &self.preview {
+                    ui.painter().image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
                 } else {
-                    Color32::from_rgba_unmultiplied(120, 120, 140, 90)
-                };
-                ui.painter().rect_stroke(
-                    r,
-                    2.0,
-                    (if sel { 2.0 } else { 1.0 }, col),
-                    egui::StrokeKind::Inside,
-                );
-                if sel {
-                    // 8 resize dots: corners + edge midpoints
-                    for z in [Zone::NW, Zone::N, Zone::NE, Zone::E, Zone::SE, Zone::S, Zone::SW, Zone::W] {
-                        let c = dot_pos(r, z);
-                        ui.painter().rect_filled(
-                            egui::Rect::from_center_size(c, Vec2::splat(DOT)),
-                            1.5,
-                            col,
-                        );
-                    }
+                    ui.painter().rect_filled(rect, 4.0, Color32::BLACK);
                 }
-            }
 
-            // hit-test: selected widget gets all 9 zones; other widgets
-            // only the interior (move). Topmost wins.
-            let hz = (8.0 / scale).clamp(4.0, 14.0); // edge grab, canvas px
-            let sel_id = self.selected;
-            let widgets = &self.theme.widgets;
-            let hit_test = move |cx: f32, cy: f32| -> Option<(u32, Zone)> {
-                if let Some(id) = sel_id {
-                    if let Some(w) = widgets.iter().find(|w| w.id == id) {
-                        if let Some(z) = zone_of(w, cx, cy, hz) {
-                            return Some((id, z));
+                // widget outlines — always in un-rotated user space
+                const DOT: f32 = 5.0; // handle dot size (screen px)
+                let dot_pos = |r: egui::Rect, z: Zone| -> egui::Pos2 {
+                    match z {
+                        Zone::NW => r.left_top(),
+                        Zone::N => r.center_top(),
+                        Zone::NE => r.right_top(),
+                        Zone::E => r.right_center(),
+                        Zone::SE => r.right_bottom(),
+                        Zone::S => r.center_bottom(),
+                        Zone::SW => r.left_bottom(),
+                        Zone::W => r.left_center(),
+                        Zone::Interior => r.center(),
+                    }
+                };
+                for w in &self.theme.widgets {
+                    let r = egui::Rect::from_min_size(
+                        rect.min + Vec2::new(w.x * scale, w.y * scale),
+                        Vec2::new(w.w * scale, w.h * scale),
+                    );
+                    let sel = self.selected == Some(w.id);
+                    let col = if sel {
+                        Color32::from_rgb(90, 200, 250)
+                    } else {
+                        Color32::from_rgba_unmultiplied(120, 120, 140, 90)
+                    };
+                    ui.painter().rect_stroke(
+                        r,
+                        2.0,
+                        (if sel { 2.0 } else { 1.0 }, col),
+                        egui::StrokeKind::Inside,
+                    );
+                    if sel {
+                        // 8 resize dots: corners + edge midpoints
+                        for z in [
+                            Zone::NW,
+                            Zone::N,
+                            Zone::NE,
+                            Zone::E,
+                            Zone::SE,
+                            Zone::S,
+                            Zone::SW,
+                            Zone::W,
+                        ] {
+                            let c = dot_pos(r, z);
+                            ui.painter().rect_filled(
+                                egui::Rect::from_center_size(c, Vec2::splat(DOT)),
+                                1.5,
+                                col,
+                            );
                         }
                     }
                 }
-                for w in widgets.iter().rev() {
-                    if w.visible && cx >= w.x && cx <= w.x + w.w && cy >= w.y && cy <= w.y + w.h {
-                        return Some((w.id, Zone::Interior));
+
+                // hit-test: selected widget gets all 9 zones; other widgets
+                // only the interior (move). Topmost wins.
+                let hz = (8.0 / scale).clamp(4.0, 14.0); // edge grab, canvas px
+                let sel_id = self.selected;
+                let widgets = &self.theme.widgets;
+                let hit_test = move |cx: f32, cy: f32| -> Option<(u32, Zone)> {
+                    if let Some(id) = sel_id
+                        && let Some(w) = widgets.iter().find(|w| w.id == id)
+                        && let Some(z) = zone_of(w, cx, cy, hz)
+                    {
+                        return Some((id, z));
+                    }
+                    for w in widgets.iter().rev() {
+                        if w.visible && cx >= w.x && cx <= w.x + w.w && cy >= w.y && cy <= w.y + w.h
+                        {
+                            return Some((w.id, Zone::Interior));
+                        }
+                    }
+                    None
+                };
+                let canvas_pos =
+                    |pos: egui::Pos2| ((pos.x - rect.min.x) / scale, (pos.y - rect.min.y) / scale);
+
+                // cursor feedback: during drag use the drag zone, else hover zone
+                let hover_zone = if let Some((_, z)) = self.drag_mode {
+                    Some(z)
+                } else {
+                    ui.ctx()
+                        .input(|i| i.pointer.latest_pos())
+                        .filter(|p| rect.contains(*p))
+                        .and_then(|p| {
+                            let (cx, cy) = canvas_pos(p);
+                            hit_test(cx, cy).map(|(_, z)| z)
+                        })
+                };
+                if let Some(z) = hover_zone {
+                    ui.ctx().set_cursor_icon(z.cursor());
+                }
+
+                // drag start → pick widget + zone, hit-tested at the *press
+                // origin* (before the pointer crossed the drag threshold)
+                if resp.drag_started() {
+                    let origin = ui
+                        .ctx()
+                        .input(|i| i.pointer.press_origin())
+                        .or_else(|| resp.interact_pointer_pos());
+                    if let Some(pos) = origin {
+                        let (cx, cy) = canvas_pos(pos);
+                        self.drag_mode = hit_test(cx, cy);
+                        if let Some((id, _)) = self.drag_mode {
+                            self.selected = Some(id);
+                        }
                     }
                 }
-                None
-            };
-            let canvas_pos = |pos: egui::Pos2| ((pos.x - rect.min.x) / scale, (pos.y - rect.min.y) / scale);
 
-            // cursor feedback: during drag use the drag zone, else hover zone
-            let hover_zone = if let Some((_, z)) = self.drag_mode {
-                Some(z)
-            } else {
-                ui.ctx()
-                    .input(|i| i.pointer.latest_pos())
-                    .filter(|p| rect.contains(*p))
-                    .and_then(|p| {
-                        let (cx, cy) = canvas_pos(p);
-                        hit_test(cx, cy).map(|(_, z)| z)
-                    })
-            };
-            if let Some(z) = hover_zone {
-                ui.ctx().set_cursor_icon(z.cursor());
-            }
-
-            // drag start → pick widget + zone, hit-tested at the *press
-            // origin* (before the pointer crossed the drag threshold)
-            if resp.drag_started() {
-                let origin = ui
-                    .ctx()
-                    .input(|i| i.pointer.press_origin())
-                    .or_else(|| resp.interact_pointer_pos());
-                if let Some(pos) = origin {
-                    let (cx, cy) = canvas_pos(pos);
-                    self.drag_mode = hit_test(cx, cy);
-                    if let Some((id, _)) = self.drag_mode {
-                        self.selected = Some(id);
-                    }
-                }
-            }
-
-            // click → select topmost
-            if resp.clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
+                // click → select topmost
+                if resp.clicked()
+                    && let Some(pos) = resp.interact_pointer_pos()
+                {
                     let (cx, cy) = canvas_pos(pos);
                     self.selected = hit_test(cx, cy).map(|(id, _)| id);
                 }
-            }
 
-            // drag → move or 8-way resize. drag_delta() is already the
-            // per-frame delta — do NOT subtract it again.
-            if resp.dragged() {
-                let inc = resp.drag_delta() / scale;
-                if let Some((id, z)) = self.drag_mode {
-                    const MINW: f32 = 20.0;
-                    const MINH: f32 = 16.0;
-                    let sample = self.feed.latest();
-                    let now = self.now_secs();
-                    if let Some(w) = self.theme.widgets.iter_mut().find(|w| w.id == id) {
-                        match z {
-                            Zone::Interior => {
-                                w.x = (w.x + inc.x).max(-w.w + 20.0).min(cw - 20.0);
-                                w.y = (w.y + inc.y).max(-w.h + 20.0).min(ch - 20.0);
-                            }
-                            z => {
-                                let (mut x, mut y, mut ww, mut hh) = (w.x, w.y, w.w, w.h);
-                                if matches!(z, Zone::W | Zone::NW | Zone::SW) {
-                                    let nx = (x + inc.x).clamp(0.0, x + ww - MINW);
-                                    ww += x - nx;
-                                    x = nx;
+                // drag → move or 8-way resize. drag_delta() is already the
+                // per-frame delta — do NOT subtract it again.
+                if resp.dragged() {
+                    let inc = resp.drag_delta() / scale;
+                    if let Some((id, z)) = self.drag_mode {
+                        const MINW: f32 = 20.0;
+                        const MINH: f32 = 16.0;
+                        let sample = self.feed.latest();
+                        let now = self.now_secs();
+                        if let Some(w) = self.theme.widgets.iter_mut().find(|w| w.id == id) {
+                            match z {
+                                Zone::Interior => {
+                                    w.x = (w.x + inc.x).max(-w.w + 20.0).min(cw - 20.0);
+                                    w.y = (w.y + inc.y).max(-w.h + 20.0).min(ch - 20.0);
                                 }
-                                if matches!(z, Zone::E | Zone::NE | Zone::SE) {
-                                    ww = (ww + inc.x).clamp(MINW, cw - x);
-                                }
-                                if matches!(z, Zone::N | Zone::NW | Zone::NE) {
-                                    let ny = (y + inc.y).clamp(0.0, y + hh - MINH);
-                                    hh += y - ny;
-                                    y = ny;
-                                }
-                                if matches!(z, Zone::S | Zone::SE | Zone::SW) {
-                                    hh = (hh + inc.y).clamp(MINH, ch - y);
-                                }
-                                w.x = x;
-                                w.y = y;
-                                w.w = ww;
-                                w.h = hh;
-                                // box resize drives the font: scale font_size
-                                // so the current text fills the new box.
-                                // (bar widgets: box = bar dims, text is capped
-                                // to bar height — no font scaling)
-                                let txt = if w.bar { String::new() } else { w.text(&sample, now) };
-                                if !txt.is_empty() {
-                                    let (tw, th) = self
-                                        .renderer
-                                        .text_size(&txt, w.font_size.max(6.0));
-                                    if tw > 0.0 && th > 0.0 {
-                                        let s = ((w.w - 16.0) / tw)
-                                            .min((w.h - 10.0) / th)
-                                            .clamp(0.05, 20.0);
-                                        w.font_size =
-                                            (w.font_size * s).clamp(6.0, 400.0);
+                                z => {
+                                    let (mut x, mut y, mut ww, mut hh) = (w.x, w.y, w.w, w.h);
+                                    if matches!(z, Zone::W | Zone::NW | Zone::SW) {
+                                        let nx = (x + inc.x).clamp(0.0, x + ww - MINW);
+                                        ww += x - nx;
+                                        x = nx;
+                                    }
+                                    if matches!(z, Zone::E | Zone::NE | Zone::SE) {
+                                        ww = (ww + inc.x).clamp(MINW, cw - x);
+                                    }
+                                    if matches!(z, Zone::N | Zone::NW | Zone::NE) {
+                                        let ny = (y + inc.y).clamp(0.0, y + hh - MINH);
+                                        hh += y - ny;
+                                        y = ny;
+                                    }
+                                    if matches!(z, Zone::S | Zone::SE | Zone::SW) {
+                                        hh = (hh + inc.y).clamp(MINH, ch - y);
+                                    }
+                                    w.x = x;
+                                    w.y = y;
+                                    w.w = ww;
+                                    w.h = hh;
+                                    // box resize drives the font: scale font_size
+                                    // so the current text fills the new box.
+                                    // (bar widgets: box = bar dims, text is capped
+                                    // to bar height — no font scaling)
+                                    let txt = if w.bar {
+                                        String::new()
+                                    } else {
+                                        w.text(&sample, now)
+                                    };
+                                    if !txt.is_empty() {
+                                        let (tw, th) =
+                                            self.renderer.text_size(&txt, w.font_size.max(6.0));
+                                        if tw > 0.0 && th > 0.0 {
+                                            let s = ((w.w - 16.0) / tw)
+                                                .min((w.h - 10.0) / th)
+                                                .clamp(0.05, 20.0);
+                                            w.font_size = (w.font_size * s).clamp(6.0, 400.0);
+                                        }
                                     }
                                 }
                             }
+                            self.mark_dirty();
                         }
-                        self.mark_dirty();
                     }
+                } else {
+                    self.drag_mode = None;
                 }
-            } else {
-                self.drag_mode = None;
-            }
 
-            ui.painter().text(
-                rect.min + Vec2::new(6.0, 6.0),
-                egui::Align2::LEFT_TOP,
-                format!(
-                    "{}×{} · preview 0° · device rot {}°",
-                    cw as u32, ch as u32, self.theme.rotation
-                ),
-                egui::FontId::proportional(13.0),
-                Color32::from_rgba_unmultiplied(180, 190, 210, 160),
-            );
-        });
+                ui.painter().text(
+                    rect.min + Vec2::new(6.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    format!(
+                        "{}×{} · preview 0° · device rot {}°",
+                        cw as u32, ch as u32, self.theme.rotation
+                    ),
+                    egui::FontId::proportional(13.0),
+                    Color32::from_rgba_unmultiplied(180, 190, 210, 160),
+                );
+            });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -920,42 +944,48 @@ impl EditorApp {
             .frame(egui::Frame::side_top_panel(ui.style()))
             .resizable(false)
             .show(ui, |ui| {
-            let st: Option<EngineStats> = self.engine.as_ref().map(|e| e.stats());
-            let s: SysSample = self.feed.latest();
-            ui.horizontal(|ui| {
-                match &st {
-                    Some(st) => {
-                        let (txt, col) = if st.connected {
-                            (format!("● {} live", st.port), Color32::from_rgb(90, 220, 130))
-                        } else {
-                            (format!("○ disconnected {}", st.last_err), Color32::from_rgb(240, 90, 80))
-                        };
-                        ui.colored_label(col, txt);
-                        ui.separator();
-                        ui.small(format!(
-                            "frames {} · jpeg {:.0}KB",
-                            st.frames_sent,
-                            st.last_jpeg_bytes as f32 / 1024.0
-                        ));
+                let st: Option<EngineStats> = self.engine.as_ref().map(|e| e.stats());
+                let s: SysSample = self.feed.latest();
+                ui.horizontal(|ui| {
+                    match &st {
+                        Some(st) => {
+                            let (txt, col) = if st.connected {
+                                (
+                                    format!("● {} live", st.port),
+                                    Color32::from_rgb(90, 220, 130),
+                                )
+                            } else {
+                                (
+                                    format!("○ disconnected {}", st.last_err),
+                                    Color32::from_rgb(240, 90, 80),
+                                )
+                            };
+                            ui.colored_label(col, txt);
+                            ui.separator();
+                            ui.small(format!(
+                                "frames {} · jpeg {:.0}KB",
+                                st.frames_sent,
+                                st.last_jpeg_bytes as f32 / 1024.0
+                            ));
+                        }
+                        None => {
+                            ui.colored_label(
+                                Color32::from_rgb(140, 170, 240),
+                                "editor — saves stream via headless service",
+                            );
+                        }
                     }
-                    None => {
-                        ui.colored_label(
-                            Color32::from_rgb(140, 170, 240),
-                            "editor — saves stream via headless service",
-                        );
-                    }
-                }
-                ui.separator();
-                ui.small(format!(
-                    "CPU {:.1}°C · GPU {:.1}°C · load {:.0}% · {:.0}W",
-                    s.cpu_tctl, s.gpu_temp, s.cpu_load, s.cpu_power
-                ));
-                if !self.status.is_empty() {
                     ui.separator();
-                    ui.small(self.status.clone());
-                }
+                    ui.small(format!(
+                        "CPU {:.1}°C · GPU {:.1}°C · load {:.0}% · {:.0}W",
+                        s.cpu_tctl, s.gpu_temp, s.cpu_load, s.cpu_power
+                    ));
+                    if !self.status.is_empty() {
+                        ui.separator();
+                        ui.small(self.status.clone());
+                    }
+                });
             });
-        });
     }
 }
 
@@ -973,7 +1003,8 @@ impl eframe::App for EditorApp {
         let feed_gen = self.feed.generation();
         let animated = matches!(
             self.bg.src,
-            Some(crate::background::Bg::Animated { .. }) | Some(crate::background::Bg::Video { .. })
+            Some(crate::background::Bg::Animated { .. })
+                | Some(crate::background::Bg::Video { .. })
         ) || self
             .theme
             .widgets

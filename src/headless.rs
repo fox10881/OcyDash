@@ -10,14 +10,14 @@
 
 use crate::background::BgEngine;
 use crate::display;
-use crate::render::{rotate_rgba_into, Renderer};
+use crate::render::{Renderer, rotate_rgba_into};
 use crate::sensors;
-use crate::theme::{last_theme_path, themes_dir, Theme};
+use crate::theme::{Theme, last_theme_path, themes_dir};
 use chrono::Timelike;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -101,23 +101,23 @@ pub fn run_headless(port: Option<String>) -> i32 {
         }
 
         // hot-reload: the editor process saves the theme file, we pick it up
-        if let Some(p) = watch.poll() {
-            if let Some(t) = Theme::load(&p) {
-                let (cw, ch) = t.canvas_size();
-                let resized = (cw, ch) != (renderer.w, renderer.h);
-                let bg_changed = serde_json::to_string(&t.background).ok()
-                    != serde_json::to_string(&theme.background).ok();
-                if resized {
-                    renderer.resize(cw, ch);
-                    bg = BgEngine::new(cw, ch);
-                }
-                if resized || bg_changed {
-                    bg.set(&t.background);
-                }
-                eprintln!("[headless] theme reloaded: {}", t.name);
-                theme = t;
-                theme_dirty = true;
+        if let Some(p) = watch.poll()
+            && let Some(t) = Theme::load(&p)
+        {
+            let (cw, ch) = t.canvas_size();
+            let resized = (cw, ch) != (renderer.w, renderer.h);
+            let bg_changed = serde_json::to_string(&t.background).ok()
+                != serde_json::to_string(&theme.background).ok();
+            if resized {
+                renderer.resize(cw, ch);
+                bg = BgEngine::new(cw, ch);
             }
+            if resized || bg_changed {
+                bg.set(&t.background);
+            }
+            eprintln!("[headless] theme reloaded: {}", t.name);
+            theme = t;
+            theme_dirty = true;
         }
 
         // refresh the cached sample only when the feed publishes a new one
@@ -139,7 +139,13 @@ pub fn run_headless(port: Option<String>) -> i32 {
                 if !w.visible || w.is_static() {
                     continue;
                 }
-                (w.x.to_bits(), w.y.to_bits(), w.w.to_bits(), w.h.to_bits(), w.bar)
+                (
+                    w.x.to_bits(),
+                    w.y.to_bits(),
+                    w.w.to_bits(),
+                    w.h.to_bits(),
+                    w.bar,
+                )
                     .hash(&mut sig);
                 w.text(&sample, now).hash(&mut sig);
                 if let Some(f) = w.bar_percent(&sample) {
@@ -269,8 +275,7 @@ fn build_tray() -> Result<
         .map_err(|e| e.to_string())?;
     menu.append(&exit).map_err(|e| e.to_string())?;
 
-    let icon =
-        Icon::from_rgba(crate::icon::disc_rgba(32), 32, 32).map_err(|e| e.to_string())?;
+    let icon = Icon::from_rgba(crate::icon::disc_rgba(32), 32, 32).map_err(|e| e.to_string())?;
     let tray = TrayIconBuilder::new()
         .with_id("ocydash")
         .with_menu(Box::new(menu))
@@ -352,11 +357,13 @@ fn pump_messages() -> bool {
 }
 
 /// One headless instance owns COM3 — named mutex guards the port.
+/// Global\ namespace: non-admin processes lack SeCreateGlobalPrivilege
+/// and cannot squat the name to block startup.
 #[cfg(windows)]
 fn single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = "Local\\OcyDashHeadless\0".encode_utf16().collect();
+    let name: Vec<u16> = "Global\\OcyDashHeadless\0".encode_utf16().collect();
     let h = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if h.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         return false;

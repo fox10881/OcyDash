@@ -82,17 +82,16 @@ pub enum Response {
 
 impl FrameParser {
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(8192) }
+        Self {
+            buf: Vec::with_capacity(8192),
+        }
     }
 
     pub fn push(&mut self, data: &[u8], out: &mut Vec<Response>) {
         self.buf.extend_from_slice(data);
         loop {
             // resync to magic
-            let pos = self
-                .buf
-                .windows(2)
-                .position(|w| w == MAGIC);
+            let pos = self.buf.windows(2).position(|w| w == MAGIC);
             match pos {
                 Some(0) => {}
                 Some(p) => {
@@ -110,7 +109,7 @@ impl FrameParser {
                 return;
             }
             let len = self.buf[2] as usize | ((self.buf[3] as usize) << 8);
-            if len < 7 || len > 0xFFFF {
+            if !(7..=0xFFFF).contains(&len) {
                 self.buf.drain(..2);
                 continue;
             }
@@ -118,6 +117,16 @@ impl FrameParser {
                 return;
             }
             let frame: Vec<u8> = self.buf.drain(..len).collect();
+            // verify the trailing u16 checksum = LE sum of all preceding
+            // bytes — a corrupt/spoofed device frame never reaches consumers
+            let sum = frame[..frame.len() - 2]
+                .iter()
+                .fold(0u32, |a, &b| a + b as u32)
+                & 0xFFFF;
+            let want = frame[frame.len() - 2] as u32 | ((frame[frame.len() - 1] as u32) << 8);
+            if sum != want {
+                continue;
+            }
             out.push(Response::Frame {
                 key: frame[4],
                 payload: frame[5..frame.len() - 2].to_vec(),

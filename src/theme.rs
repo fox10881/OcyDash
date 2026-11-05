@@ -39,9 +39,7 @@ pub enum Background {
 
 impl Default for Background {
     fn default() -> Self {
-        Background::Color {
-            color: [8, 10, 16],
-        }
+        Background::Color { color: [8, 10, 16] }
     }
 }
 
@@ -87,7 +85,12 @@ impl WidgetKind {
         ("RAM Free", WidgetKind::RamFree),
         ("RAM Load", WidgetKind::RamLoad),
         ("Clock", WidgetKind::Clock),
-        ("Custom Text", WidgetKind::CustomText { text: String::new() }),
+        (
+            "Custom Text",
+            WidgetKind::CustomText {
+                text: String::new(),
+            },
+        ),
     ];
 
     pub fn label(&self) -> &'static str {
@@ -133,16 +136,12 @@ impl WidgetKind {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum Align {
     Left,
+    #[default]
     Center,
     Right,
-}
-impl Default for Align {
-    fn default() -> Self {
-        Align::Center
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -294,41 +293,87 @@ impl Widget {
         if !s.alive {
             match &self.kind {
                 WidgetKind::Clock | WidgetKind::CustomText { .. } => {}
-                WidgetKind::CpuName | WidgetKind::GpuName
-                    if !self.text_override.is_empty() => {}
+                WidgetKind::CpuName | WidgetKind::GpuName if !self.text_override.is_empty() => {}
                 _ => return "---".into(),
             }
         }
         match &self.kind {
             WidgetKind::CpuTemp => {
-                format!("{:.*}{}", d, self.val(s, CpuTemp, s.cpu_tctl), if self.show_unit { "°C" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, CpuTemp, s.cpu_tctl),
+                    if self.show_unit { "°C" } else { "" }
+                )
             }
             WidgetKind::GpuTemp => {
-                format!("{:.*}{}", d, self.val(s, GpuTemp, s.gpu_temp), if self.show_unit { "°C" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, GpuTemp, s.gpu_temp),
+                    if self.show_unit { "°C" } else { "" }
+                )
             }
             WidgetKind::CpuDieTemp => {
-                format!("{:.*}{}", d, self.val(s, CpuTemp, s.cpu_die), if self.show_unit { "°C" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, CpuTemp, s.cpu_die),
+                    if self.show_unit { "°C" } else { "" }
+                )
             }
             WidgetKind::CpuLoad => {
-                format!("{:.*}{}", d, self.val(s, CpuLoad, s.cpu_load), if self.show_unit { "%" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, CpuLoad, s.cpu_load),
+                    if self.show_unit { "%" } else { "" }
+                )
             }
             WidgetKind::GpuLoad => {
-                format!("{:.*}{}", d, self.val(s, GpuLoad, s.gpu_load), if self.show_unit { "%" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, GpuLoad, s.gpu_load),
+                    if self.show_unit { "%" } else { "" }
+                )
             }
             WidgetKind::CpuPower => {
-                format!("{:.*}{}", d, self.val(s, CpuPower, s.cpu_power), if self.show_unit { "W" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, CpuPower, s.cpu_power),
+                    if self.show_unit { "W" } else { "" }
+                )
             }
             WidgetKind::GpuPower => {
-                format!("{:.*}{}", d, self.val(s, GpuPower, s.gpu_power), if self.show_unit { "W" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, GpuPower, s.gpu_power),
+                    if self.show_unit { "W" } else { "" }
+                )
             }
             WidgetKind::CpuFan => {
-                format!("{:.0}{}", self.val(s, CpuFan, s.cpu_fan), if self.show_unit { " RPM" } else { "" })
+                format!(
+                    "{:.0}{}",
+                    self.val(s, CpuFan, s.cpu_fan),
+                    if self.show_unit { " RPM" } else { "" }
+                )
             }
             WidgetKind::PumpFan => {
-                format!("{:.0}{}", self.val(s, CpuFan, s.pump_fan), if self.show_unit { " RPM" } else { "" })
+                format!(
+                    "{:.0}{}",
+                    self.val(s, CpuFan, s.pump_fan),
+                    if self.show_unit { " RPM" } else { "" }
+                )
             }
             WidgetKind::GpuFan => {
-                format!("{:.0}{}", self.val(s, GpuFan, s.gpu_fan), if self.show_unit { " RPM" } else { "" })
+                format!(
+                    "{:.0}{}",
+                    self.val(s, GpuFan, s.gpu_fan),
+                    if self.show_unit { " RPM" } else { "" }
+                )
             }
             WidgetKind::CpuName => {
                 if self.text_override.is_empty() {
@@ -345,16 +390,36 @@ impl Widget {
                 }
             }
             WidgetKind::RamTotal => {
-                format!("{:.*}{}", d, s.ram_total, if self.show_unit { " GB" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    s.ram_total,
+                    if self.show_unit { " GB" } else { "" }
+                )
             }
             WidgetKind::RamUsed => {
-                format!("{:.*}{}", d, s.ram_used, if self.show_unit { " GB" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    s.ram_used,
+                    if self.show_unit { " GB" } else { "" }
+                )
             }
             WidgetKind::RamFree => {
-                format!("{:.*}{}", d, s.ram_free, if self.show_unit { " GB" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    s.ram_free,
+                    if self.show_unit { " GB" } else { "" }
+                )
             }
             WidgetKind::RamLoad => {
-                format!("{:.*}{}", d, self.val(s, RamLoad, s.ram_load), if self.show_unit { "%" } else { "" })
+                format!(
+                    "{:.*}{}",
+                    d,
+                    self.val(s, RamLoad, s.ram_load),
+                    if self.show_unit { "%" } else { "" }
+                )
             }
             WidgetKind::Clock => {
                 let t = now_secs as u64;
@@ -435,8 +500,7 @@ impl Theme {
     pub fn save(&mut self) -> std::io::Result<PathBuf> {
         self.localize_background();
         let path = themes_dir().join(format!("{}.json", sanitize(&self.name)));
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         fs::write(&path, json)?;
         Ok(path)
     }
@@ -449,15 +513,20 @@ impl Theme {
         let dir = themes_dir();
         let stem = sanitize(&self.name);
         let mut keep: Option<PathBuf> = None;
-        if let Background::Image { path } | Background::Video { path, .. } =
-            &mut self.background
-        {
+        if let Background::Image { path } | Background::Video { path, .. } = &mut self.background {
             let src = PathBuf::from(path.as_str());
             let ext = src
                 .extension()
                 .map(|e| e.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if !ext.is_empty() {
+            // only localize sources the user can already read freely —
+            // a theme JSON is writable by any same-user process, so an
+            // unguarded fs::copy is a privilege-mediated read: pointing
+            // `background.path` at an admin-only file exfiltrates it
+            // into the user-readable themes dir on the next autosave.
+            // Sources outside the user's own tree simply keep their
+            // absolute path (still playable — just not self-contained).
+            if !ext.is_empty() && user_owned_source(&src) {
                 let dst = dir.join(format!("{stem}.{ext}"));
                 if src.is_file() && src != dst && fs::copy(&src, &dst).is_ok() {
                     *path = dst.to_string_lossy().into_owned();
@@ -473,8 +542,7 @@ impl Theme {
         if let Ok(rd) = fs::read_dir(&dir) {
             for e in rd.filter_map(|e| e.ok()) {
                 let p = e.path();
-                let same_stem =
-                    p.file_stem().map(|s| s == stem.as_str()).unwrap_or(false);
+                let same_stem = p.file_stem().map(|s| s == stem.as_str()).unwrap_or(false);
                 let is_json = p.extension().map(|x| x == "json").unwrap_or(false);
                 if same_stem && !is_json && keep.as_ref() != Some(&p) {
                     let _ = fs::remove_file(&p);
@@ -484,8 +552,52 @@ impl Theme {
     }
 
     pub fn load(path: &PathBuf) -> Option<Self> {
+        // theme files are same-user writable — cap before reading so a
+        // multi-GB planted file can't be slurped on every hot-reload
+        if fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 2 * 1024 * 1024 {
+            return None;
+        }
         let json = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&json).ok()
+        let mut t: Self = serde_json::from_str(&json).ok()?;
+        t.sanitize();
+        Some(t)
+    }
+
+    /// Defensive fix-ups on a loaded theme — the JSON lives in %APPDATA%
+    /// which any same-user (non-admin) process can write, so treat its
+    /// contents as untrusted:
+    /// - background media paths must be absolute `X:\`/`X:/` local paths.
+    ///   Anything else — UNC/device paths (NTLM-leak via outbound SMB),
+    ///   relative paths (CWD-dependent), and every ffmpeg URI scheme
+    ///   (lavfi:, http:, pipe:, concat:, subfile:…) — demotes to a plain
+    ///   color background. ffmpeg additionally runs with
+    ///   `-protocol_whitelist file` as belt-and-suspenders.
+    /// - widget box sizes clamped to a sane range so a hostile file can't
+    ///   create absurd geometries.
+    fn sanitize(&mut self) {
+        let hostile_path = |p: &String| {
+            let b = p.as_bytes();
+            !(b.len() >= 3
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && (b[2] == b'\\' || b[2] == b'/'))
+        };
+        let demote = match &self.background {
+            Background::Image { path } | Background::Video { path, .. } => hostile_path(path),
+            _ => false,
+        };
+        if demote {
+            self.background = Background::Color {
+                color: [10, 10, 16],
+            };
+        }
+        for w in &mut self.widgets {
+            w.x = w.x.clamp(-4096.0, 16384.0);
+            w.y = w.y.clamp(-4096.0, 16384.0);
+            w.w = w.w.clamp(0.0, 16384.0);
+            w.h = w.h.clamp(0.0, 16384.0);
+            w.font_size = w.font_size.clamp(6.0, 400.0);
+        }
     }
 
     pub fn alloc_id(&mut self) -> u32 {
@@ -506,8 +618,36 @@ impl Theme {
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
+}
+
+/// Is `src` somewhere the interactive user can already read without
+/// elevation? Used by `localize_background` — copying an admin-only file
+/// into the user-readable themes dir would be a privilege-mediated
+/// exfiltration via planted theme JSON. Canonicalizing both sides kills
+/// symlink/junction/8.3 tricks (`user\link -> C:\Windows` resolves out).
+fn user_owned_source(src: &std::path::Path) -> bool {
+    let Ok(src) = src.canonicalize() else {
+        return false;
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        roots.push(PathBuf::from(up));
+    }
+    roots.push(themes_dir());
+    roots.push(std::env::temp_dir());
+    roots.iter().any(|r| {
+        r.canonicalize()
+            .map(|rr| src.starts_with(&rr))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]

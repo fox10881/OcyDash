@@ -116,8 +116,7 @@ impl Renderer {
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         let mut glyphs = Vec::new();
-        let (mut min_x, mut min_y, mut max_x, mut max_y) =
-            (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for run in buffer.layout_runs() {
             for g in run.glyphs {
                 let phys = g.physical((0.0, run.line_y), 1.0);
@@ -161,11 +160,7 @@ impl Renderer {
     }
 
     fn blit_glyph(&mut self, x: i32, y: i32, key: CacheKey, c: Rgba) {
-        let img = match self
-            .swash
-            .get_image(&mut self.font_system, key)
-            .as_ref()
-        {
+        let img = match self.swash.get_image(&mut self.font_system, key).as_ref() {
             Some(i) => i,
             None => return,
         };
@@ -188,8 +183,7 @@ impl Renderer {
                         }
                         let di = ((dy as usize) * self.w + dx as usize) * 4;
                         let inv = 255 - a;
-                        self.px[di] =
-                            ((c.0 as u32 * a + self.px[di] as u32 * inv) / 255) as u8;
+                        self.px[di] = ((c.0 as u32 * a + self.px[di] as u32 * inv) / 255) as u8;
                         self.px[di + 1] =
                             ((c.1 as u32 * a + self.px[di + 1] as u32 * inv) / 255) as u8;
                         self.px[di + 2] =
@@ -221,10 +215,8 @@ impl Renderer {
                         let di = ((dy as usize) * self.w + dx as usize) * 4;
                         let inv = 255 - a;
                         self.px[di] = ((r * a + self.px[di] as u32 * inv) / 255) as u8;
-                        self.px[di + 1] =
-                            ((g * a + self.px[di + 1] as u32 * inv) / 255) as u8;
-                        self.px[di + 2] =
-                            ((b * a + self.px[di + 2] as u32 * inv) / 255) as u8;
+                        self.px[di + 1] = ((g * a + self.px[di + 1] as u32 * inv) / 255) as u8;
+                        self.px[di + 2] = ((b * a + self.px[di + 2] as u32 * inv) / 255) as u8;
                         self.px[di + 3] = 255;
                     }
                 }
@@ -398,10 +390,10 @@ impl Renderer {
             if !w.visible {
                 continue;
             }
-            if let Some(st) = want_static {
-                if w.is_static() != st {
-                    continue;
-                }
+            if let Some(st) = want_static
+                && w.is_static() != st
+            {
+                continue;
             }
             // progress-bar mode: box strictly defines bar dimensions
             if w.bar {

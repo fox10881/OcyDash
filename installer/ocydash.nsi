@@ -97,6 +97,9 @@ Section "Uninstall"
     nsExec::ExecToStack 'taskkill /F /T /IM SystemInfos.exe'
     Pop $0
     Pop $1
+    ; taskkill is async — give exiting processes a beat to release file
+    ; handles before Delete runs, and mark any stragglers for reboot
+    Sleep 1500
 
     ; remove autostart — Task Scheduler task (elevated apps can't use
     ; the Run key) plus the legacy HKCU value from earlier builds
@@ -108,14 +111,14 @@ Section "Uninstall"
     Delete "$DESKTOP\OcyDash.lnk"
     RMDir /r "$SMPROGRAMS\OcyDash"
 
-    Delete "$INSTDIR\${APP_EXE}"
-    Delete "$INSTDIR\ffmpeg.exe"
-    Delete "$INSTDIR\ocydash.ico"
-    Delete "$INSTDIR\LICENSE"
-    Delete "$INSTDIR\README.md"
-    Delete "$INSTDIR\uninstall.exe"
-    RMDir /r "$INSTDIR\SystemInfos"
-    RMDir "$INSTDIR"
+    Delete /REBOOTOK "$INSTDIR\${APP_EXE}"
+    Delete /REBOOTOK "$INSTDIR\ffmpeg.exe"
+    Delete /REBOOTOK "$INSTDIR\ocydash.ico"
+    Delete /REBOOTOK "$INSTDIR\LICENSE"
+    Delete /REBOOTOK "$INSTDIR\README.md"
+    Delete /REBOOTOK "$INSTDIR\uninstall.exe"
+    RMDir /r /REBOOTOK "$INSTDIR\SystemInfos"
+    RMDir /REBOOTOK "$INSTDIR"
 
     DeleteRegKey HKLM "${APP_UNINST}"
     ; user themes (%APPDATA%\ocydash) intentionally kept

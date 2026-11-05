@@ -11,8 +11,8 @@ use crate::theme::Background;
 use image::AnimationDecoder;
 use std::collections::VecDeque;
 use std::io::Read;
-use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,11 +33,23 @@ fn ffmpeg_path() -> PathBuf {
 const VIDEO_RING: usize = 8;
 /// cap total decoded GIF bytes — frames decimate to fit (~66 frames)
 const GIF_MAX_BYTES: usize = 80 * 1024 * 1024;
+/// GIF file-size cap — theme paths are same-user writable; a multi-GB
+/// file would be slurped whole before decode even starts
+const GIF_MAX_FILE: u64 = 256 * 1024 * 1024;
+/// cumulative RAW decoded-frame bytes cap — a small file can still
+/// decompress to GBs of RGBA (GIF is a codec bomb by nature)
+const GIF_MAX_DECODE: usize = 1024 * 1024 * 1024;
 
 pub enum Bg {
     Color([u8; 3]),
-    Static { rgba: Vec<u8> },
-    Animated { frames: Vec<(Vec<u8>, u32)>, idx: usize, last: Instant },
+    Static {
+        rgba: Vec<u8>,
+    },
+    Animated {
+        frames: Vec<(Vec<u8>, u32)>,
+        idx: usize,
+        last: Instant,
+    },
     Video {
         ring: Arc<Mutex<VecDeque<Arc<Vec<u8>>>>>,
         /// recycled frame buffers — consumed/evicted frames return here
@@ -57,7 +69,12 @@ pub struct BgEngine {
 
 impl BgEngine {
     pub fn new(w: usize, h: usize) -> Self {
-        Self { w, h, src: None, err: None }
+        Self {
+            w,
+            h,
+            src: None,
+            err: None,
+        }
     }
 
     /// Would the next `blit` produce NEW pixels? Animated → next frame's
@@ -67,8 +84,7 @@ impl BgEngine {
     pub fn advance_pending(&self) -> bool {
         match &self.src {
             Some(Bg::Animated { frames, idx, last }) => {
-                !frames.is_empty()
-                    && last.elapsed().as_millis() as u32 >= frames[*idx].1.max(30)
+                !frames.is_empty() && last.elapsed().as_millis() as u32 >= frames[*idx].1.max(30)
             }
             Some(Bg::Video { ring, .. }) => !ring.lock().unwrap().is_empty(),
             _ => false,
@@ -87,14 +103,20 @@ impl BgEngine {
                 // playback speed preserved). This trades ~60MB RAM for a
                 // permanently idle ffmpeg (0% decode cpu) + memcpy blits.
                 match load_image(path, self.w, self.h) {
-                    Ok(frames) if frames.len() == 1 => Bg::Static { rgba: frames.into_iter().next().unwrap().0 },
-                    Ok(frames) => Bg::Animated { frames, idx: 0, last: Instant::now() },
+                    Ok(frames) if frames.len() == 1 => Bg::Static {
+                        rgba: frames.into_iter().next().unwrap().0,
+                    },
+                    Ok(frames) => Bg::Animated {
+                        frames,
+                        idx: 0,
+                        last: Instant::now(),
+                    },
                     Err(e) => {
                         self.err = Some(e);
                         Bg::Color([10, 10, 16])
                     }
                 }
-            },
+            }
             Background::Video { path, fps } => self.start_video(path, *fps),
         });
     }
@@ -109,17 +131,29 @@ impl BgEngine {
         }
         let fps = fps.clamp(1, 30);
         let (w, h) = (self.w, self.h);
-        let vf = format!(
-            "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={fps}"
-        );
+        let vf =
+            format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={fps}");
+        // theme JSON is same-user writable — `path` is untrusted input.
+        // `-protocol_whitelist file` blocks every non-file demuxer the
+        // string could smuggle in (lavfi: filtergraph exec, pipe:/concat:
+        // for arbitrary file reads, http:/rtsp: for outbound connects)
+        // — sanitize() additionally pins paths to `X:\` local form.
         let child = Command::new(ffmpeg)
             .args([
-                "-loglevel", "error",
-                "-stream_loop", "-1",
-                "-i", path,
-                "-vf", &vf,
-                "-f", "rawvideo",
-                "-pix_fmt", "rgba",
+                "-loglevel",
+                "error",
+                "-protocol_whitelist",
+                "file",
+                "-stream_loop",
+                "-1",
+                "-i",
+                path,
+                "-vf",
+                &vf,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
                 "-",
             ])
             .stdout(Stdio::piped())
@@ -127,9 +161,7 @@ impl BgEngine {
             .stdin(Stdio::null())
             // ffmpeg is console-subsystem — suppress its window from a
             // windowless (windows_subsystem) parent
-            .creation_flags(
-                windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
-            )
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .spawn();
         let mut child = match child {
             Ok(c) => c,
@@ -186,14 +218,19 @@ impl BgEngine {
                 }
             }
         });
-        Bg::Video { ring, pool, stop, child: Some(child) }
+        Bg::Video {
+            ring,
+            pool,
+            stop,
+            child: Some(child),
+        }
     }
 
     /// Current base canvas: fills `out` (w*h*4). Cheap — copy or fill.
     pub fn blit(&mut self, out: &mut Vec<u8>) {
         match &mut self.src {
             Some(Bg::Color(c)) => {
-                for px in out.chunks_exact_mut(4) {
+                for px in out.as_chunks_mut::<4>().0 {
                     px[0] = c[0];
                     px[1] = c[1];
                     px[2] = c[2];
@@ -249,9 +286,13 @@ impl BgEngine {
     }
 }
 
-impl Drop for BgEngine {
+/// Killing the ffmpeg child must happen on EVERY Bg::Video drop — not
+/// just engine teardown. `set()` does `self.src = None` on each theme
+/// switch; without this Drop the orphaned ffmpeg + reader thread kept
+/// decoding until process exit (job objects only reap with the parent).
+impl Drop for Bg {
     fn drop(&mut self) {
-        if let Some(Bg::Video { stop, child, .. }) = &mut self.src {
+        if let Bg::Video { stop, child, .. } = self {
             stop.store(true, Ordering::Relaxed);
             if let Some(c) = child {
                 let _ = c.kill();
@@ -276,31 +317,56 @@ fn load_image(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, Str
 }
 
 fn load_gif(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, String> {
+    let flen = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if flen == 0 || flen > GIF_MAX_FILE {
+        return Err(format!("gif: file size {flen} out of range"));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("open {path}: {e}"))?;
     // estimated frame count = Graphic Control Extension blocks (one per
     // image frame) → uniform decimation stride to fit the RAM cap. Every
     // frame still decodes (GIF frames are dependent) but only stride-th
     // ones are kept; skipped delays fold into the previous kept frame.
-    let est_frames = bytes.windows(3).filter(|b| b == b"\x21\xF9\x04").count().max(1);
+    let est_frames = bytes
+        .windows(3)
+        .filter(|b| b == b"\x21\xF9\x04")
+        .count()
+        .max(1);
     let cap_frames = (GIF_MAX_BYTES / (w * h * 4)).max(1);
     let stride = est_frames.div_ceil(cap_frames).max(1);
-    let dec = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(std::io::Cursor::new(bytes)))
-        .map_err(|e| format!("gif decode: {e}"))?;
-    let frames = dec.into_frames().collect_frames().map_err(|e| format!("gif frames: {e}"))?;
-    if frames.is_empty() {
-        return Err("gif: no frames".into());
-    }
+    let dec =
+        image::codecs::gif::GifDecoder::new(std::io::BufReader::new(std::io::Cursor::new(bytes)))
+            .map_err(|e| format!("gif decode: {e}"))?;
+    // iterate frames manually with a cumulative decoded-byte cap — the
+    // 80MB kept-frames cap only applies AFTER resize, so without this a
+    // hostile GIF could still decode to gigabytes of source RGBA
+    let mut frames_iter = dec.into_frames();
+    let mut src_bytes = 0usize;
     let mut out = Vec::new();
     let mut total = 0usize;
     // composite logical-screen frames so transparency accumulates correctly
     let mut canvas = vec![0u8; w * h * 4];
-    for (i, f) in frames.into_iter().enumerate() {
+    for i in 0..usize::MAX {
+        let f = match frames_iter.next() {
+            Some(Ok(f)) => f,
+            Some(Err(e)) => return Err(format!("gif frames: {e}")),
+            None => break,
+        };
         let delay = f.delay().numer_denom_ms();
         let delay_ms = delay.0 / delay.1.max(1);
-        let img = image::DynamicImage::ImageRgba8(f.into_buffer());
+        let buf = f.into_buffer();
+        src_bytes += buf.as_raw().len();
+        if src_bytes > GIF_MAX_DECODE {
+            return Err("gif: decoded size cap exceeded".into());
+        }
+        let img = image::DynamicImage::ImageRgba8(buf);
         let img = cover_resize(&img, w, h).into_rgba8();
         // alpha-composite over canvas (gif frames may be partial)
-        for (dst, src) in canvas.chunks_exact_mut(4).zip(img.as_raw().chunks_exact(4)) {
+        for (dst, src) in canvas
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(img.as_raw().chunks_exact(4))
+        {
             let a = src[3] as u32;
             if a == 255 {
                 dst.copy_from_slice(src);
@@ -345,7 +411,10 @@ fn load_gif(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, Strin
 fn cover_resize(img: &image::DynamicImage, w: usize, h: usize) -> image::DynamicImage {
     let (iw, ih) = (img.width(), img.height());
     let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32);
-    let (sw, sh) = ((iw as f32 * scale).round() as u32, (ih as f32 * scale).round() as u32);
+    let (sw, sh) = (
+        (iw as f32 * scale).round() as u32,
+        (ih as f32 * scale).round() as u32,
+    );
     let img = img.resize(sw, sh, image::imageops::FilterType::Triangle);
     let x = sw.saturating_sub(w as u32) / 2;
     let y = sh.saturating_sub(h as u32) / 2;

@@ -9,12 +9,12 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/ocydash.ico");
     println!("cargo:rerun-if-changed=assets/ocydash.manifest");
 
-    if which_on_path("rc.exe").is_none() {
-        if let Some(dir) = sdk_rc_dir() {
-            let path = std::env::var("PATH").unwrap_or_default();
-            // safe: the build-script process is still single-threaded here
-            unsafe { std::env::set_var("PATH", format!("{dir};{path}")) };
-        }
+    if which_on_path("rc.exe").is_none()
+        && let Some(dir) = sdk_rc_dir()
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        // safe: the build-script process is still single-threaded here
+        unsafe { std::env::set_var("PATH", format!("{dir};{path}")) };
     }
     let _ = embed_resource::compile("assets/ocydash.rc", embed_resource::NONE);
 }
@@ -36,7 +36,12 @@ fn sdk_rc_dir() -> Option<String> {
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    vers.sort();
+    // numeric compare — lexicographic puts "10.0.9200" above "10.0.17763"
+    vers.sort_by(|a, b| {
+        let parts =
+            |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+        parts(a).cmp(&parts(b))
+    });
     vers.reverse();
     for v in vers {
         let dir = format!(r"C:\Program Files (x86)\Windows Kits\10\bin\{v}\x64");

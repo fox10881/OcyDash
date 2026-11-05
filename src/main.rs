@@ -31,8 +31,8 @@ mod sensors;
 mod startup;
 mod theme;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--editor" || a == "--edit") {
@@ -84,14 +84,15 @@ fn run_editor() -> eframe::Result<()> {
 /// Only one editor instance at a time: named mutex, and if it is already
 /// held we raise the existing "OcyDash — Editor" window and exit quietly.
 fn editor_single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
     };
-    let name: Vec<u16> = "Local\\OcyDashEditor\0".encode_utf16().collect();
+    // Global\ — un-squattable by non-admin processes (needs
+    // SeCreateGlobalPrivilege); also matches the headless mutex scope
+    // across Task-Scheduler vs interactive sessions.
+    let name: Vec<u16> = "Global\\OcyDashEditor\0".encode_utf16().collect();
     let h = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if h.is_null() {
         return true; // lock failed — don't block the user

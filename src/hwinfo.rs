@@ -21,9 +21,11 @@
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
+use windows_sys::Win32::Foundation::FreeLibrary;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 const ORD_INIT: u32 = 863;
+const ORD_DEINIT: u32 = 416;
 const ORD_COUNT: u32 = 723;
 const ORD_READ: u32 = 366;
 const ORD_VALUE: u32 = 906;
@@ -43,6 +45,7 @@ pub const LOC_GPU: u32 = 13;
 pub const LOC_COOLER: u32 = 22;
 
 type InitFn = unsafe extern "C" fn(i32) -> i32;
+type DeInitFn = unsafe extern "C" fn();
 type CountFn = unsafe extern "C" fn() -> i32;
 type ReadFn = unsafe extern "C" fn(i32);
 type ValueFn = unsafe extern "C" fn(u32, i32, i32, *mut c_void) -> bool;
@@ -202,15 +205,27 @@ impl Hwinfo {
                 (ORD_VALUE, "Value"),
             ] {
                 if sym(ord).is_null() {
+                    FreeLibrary(lib);
                     return Err(format!("export ordinal {ord} ({name}) missing"));
                 }
             }
+            // Init acquires the SINGLE-CLIENT driver slot — on every
+            // error path from here we must DeInit + FreeLibrary or the
+            // slot stays held and the SystemInfos.exe fallback can never
+            // acquire it (sensors dead until process restart)
             let rc = init(0);
             if rc != 0 {
+                FreeLibrary(lib);
                 return Err(format!("HWi32_Init(0) -> {rc}"));
             }
             let n = count();
             if n <= 0 {
+                let deinit: Option<DeInitFn> = (!sym(ORD_DEINIT).is_null())
+                    .then(|| std::mem::transmute::<*mut c_void, DeInitFn>(sym(ORD_DEINIT)));
+                if let Some(d) = deinit {
+                    d();
+                }
+                FreeLibrary(lib);
                 return Err(format!("{n} sensors detected"));
             }
             // discovery sweep — one pass, cached forever. Filtered to the
@@ -226,8 +241,7 @@ impl Hwinfo {
                 for ty in [TY_TEMP, TY_FAN, TY_POWER, TY_USAGE, TY_OTHER] {
                     for idx in 0..128 {
                         let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
-                        if !(value(ty, i, idx, &mut r as *mut _ as *mut c_void)
-                            && r.is_valid != 0)
+                        if !(value(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0)
                         {
                             continue;
                         }
@@ -236,7 +250,12 @@ impl Hwinfo {
                             continue;
                         }
                         let hot = is_hot(r.sensor_loc, &name);
-                        slots.push(Slot { sensor: i, ty, idx, hot });
+                        slots.push(Slot {
+                            sensor: i,
+                            ty,
+                            idx,
+                            hot,
+                        });
                         cache.push(Reading {
                             loc: r.sensor_loc,
                             ty,
@@ -312,7 +331,7 @@ impl Hwinfo {
                 }
             } else {
                 for &(s, int) in &self.hot_sensors {
-                    if self.tick % int == 0 {
+                    if self.tick.is_multiple_of(int) {
                         (self.read)(s);
                         if (s as usize) < refreshed.len() {
                             refreshed[s as usize] = true;
@@ -322,7 +341,10 @@ impl Hwinfo {
             }
             for k in 0..self.slots.len() {
                 let sl = self.slots[k];
-                if !full && !refreshed[sl.sensor as usize] {
+                // sensor is i32 and discovery bounds it to 0..32 — guard
+                // anyway so a bad index can never wrap into an OOB panic
+                let si = sl.sensor as usize;
+                if !full && (sl.sensor < 0 || si >= refreshed.len() || !refreshed[si]) {
                     continue;
                 }
                 let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();

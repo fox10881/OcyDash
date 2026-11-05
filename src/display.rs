@@ -4,8 +4,8 @@
 //! responses, and auto-reconnects on write failure.
 
 use crate::protocol::{
-    cmd_frame, jpeg_frame, FrameParser, Response, KEY_GET_INFO, KEY_LIVE,
-    KEY_MOTION_TIMEOUT, KEY_RT_PLAY_TIMEOUT,
+    FrameParser, KEY_GET_INFO, KEY_LIVE, KEY_MOTION_TIMEOUT, KEY_RT_PLAY_TIMEOUT, Response,
+    cmd_frame, jpeg_frame,
 };
 use serialport::{SerialPort, SerialPortType};
 use std::io::{Read, Write};
@@ -56,10 +56,11 @@ impl EngineHandle {
 pub fn find_port() -> Option<String> {
     let ports = serialport::available_ports().ok()?;
     for p in &ports {
-        if let SerialPortType::UsbPort(u) = &p.port_type {
-            if u.vid == VID && u.pid == PID {
-                return Some(p.port_name.clone());
-            }
+        if let SerialPortType::UsbPort(u) = &p.port_type
+            && u.vid == VID
+            && u.pid == PID
+        {
+            return Some(p.port_name.clone());
         }
     }
     None
@@ -82,9 +83,15 @@ fn reader_thread(mut port: Box<dyn SerialPort>, stop: Arc<AtomicBool>) {
         let mut parser = FrameParser::new();
         let mut responses = Vec::new();
         let mut buf = [0u8; 8192];
+        // consecutive non-timeout errors → the port is dead (device
+        // unplugged / engine dropped the writer half). Exit instead of
+        // spinning forever — a leaked reader keeps its cloned COM handle
+        // open and blocks the engine's next reconnect attempt
+        let mut dead = 0u32;
         while !stop.load(Ordering::Relaxed) {
             match port.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    dead = 0;
                     parser.push(&buf[..n], &mut responses);
                     for r in responses.drain(..) {
                         let Response::Frame { key, payload } = r;
@@ -102,7 +109,13 @@ fn reader_thread(mut port: Box<dyn SerialPort>, stop: Arc<AtomicBool>) {
                 }
                 Ok(_) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                Err(_) => {
+                    dead += 1;
+                    if dead >= 25 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         }
     });
@@ -117,9 +130,7 @@ pub fn start(port_name: Option<String>, stop: Arc<AtomicBool>) -> EngineHandle {
         stats: stats.clone(),
         stop: stop.clone(),
     };
-    std::thread::spawn(move || {
-        engine_loop(port_name, slot, stats, stop)
-    });
+    std::thread::spawn(move || engine_loop(port_name, slot, stats, stop));
     handle
 }
 

@@ -12,8 +12,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const HELPER: &str =
-    r"E:\Project\Ocypus Display rust\vendor\SystemInfos\SystemInfos.exe";
+const HELPER: &str = r"E:\Project\Ocypus Display rust\vendor\SystemInfos\SystemInfos.exe";
 const WATCH_SECS: u64 = 50;
 
 struct Mode {
@@ -30,7 +29,9 @@ fn temp_bin(name: &str) -> PathBuf {
 
 fn scan<'a>(json: &'a str, key: &str) -> String {
     let pat = format!("\"{key}\":\"");
-    let Some(i) = json.find(&pat) else { return String::new() };
+    let Some(i) = json.find(&pat) else {
+        return String::new();
+    };
     let rest = &json[i + pat.len()..];
     let end = rest.find('"').unwrap_or(rest.len().min(32));
     rest[..end].to_string()
@@ -47,7 +48,9 @@ fn spawn(mode: &Mode, bin_name: &str) -> Option<Child> {
         c.env("TEMP", &t).env("TMP", &t);
     }
     if mode.stdio_null {
-        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
     }
     if mode.no_window {
         c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
@@ -104,17 +107,55 @@ fn watch(bin: &PathBuf) -> bool {
 
 fn main() {
     let modes = [
-        Mode { name: "plain    ", cwd: false, env: false, stdio_null: false, no_window: false },
-        Mode { name: "cwd      ", cwd: true,  env: false, stdio_null: false, no_window: false },
-        Mode { name: "env      ", cwd: false, env: true,  stdio_null: false, no_window: false },
-        Mode { name: "stdio    ", cwd: false, env: false, stdio_null: true,  no_window: false },
-        Mode { name: "nowin    ", cwd: false, env: false, stdio_null: false, no_window: true  },
-        Mode { name: "full(app)", cwd: true,  env: true,  stdio_null: true,  no_window: true  },
+        Mode {
+            name: "plain    ",
+            cwd: false,
+            env: false,
+            stdio_null: false,
+            no_window: false,
+        },
+        Mode {
+            name: "cwd      ",
+            cwd: true,
+            env: false,
+            stdio_null: false,
+            no_window: false,
+        },
+        Mode {
+            name: "env      ",
+            cwd: false,
+            env: true,
+            stdio_null: false,
+            no_window: false,
+        },
+        Mode {
+            name: "stdio    ",
+            cwd: false,
+            env: false,
+            stdio_null: true,
+            no_window: false,
+        },
+        Mode {
+            name: "nowin    ",
+            cwd: false,
+            env: false,
+            stdio_null: false,
+            no_window: true,
+        },
+        Mode {
+            name: "full(app)",
+            cwd: true,
+            env: true,
+            stdio_null: true,
+            no_window: true,
+        },
     ];
     let only: Option<String> = std::env::args().nth(1);
     for (i, m) in modes.iter().enumerate() {
         if let Some(o) = &only {
-            if !m.name.trim().starts_with(o.as_str()) && !o.parse::<usize>().map(|n| n == i).unwrap_or(false) {
+            if !m.name.trim().starts_with(o.as_str())
+                && !o.parse::<usize>().map(|n| n == i).unwrap_or(false)
+            {
                 continue;
             }
         }
@@ -124,7 +165,14 @@ fn main() {
         println!("=== mode {} [{}] bin={} ===", i, m.name, bin.display());
         let mut child = spawn(m, &bin_name);
         let ok = watch(&bin);
-        println!("  --> {}", if ok { "LIVE — values advancing" } else { "DEAD — no write in window" });
+        println!(
+            "  --> {}",
+            if ok {
+                "LIVE — values advancing"
+            } else {
+                "DEAD — no write in window"
+            }
+        );
         if let Some(c) = &mut child {
             let _ = c.kill();
         }
