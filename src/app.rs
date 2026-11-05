@@ -250,8 +250,11 @@ impl EditorApp {
             self.renderer.h,
             self.theme.rotation,
         );
-        let jpeg = self.renderer.encode_jpeg(self.theme.jpeg_quality, &rgba, w, h);
-        if !jpeg.is_empty() {
+        let mut jpeg = Vec::new();
+        if self
+            .renderer
+            .encode_jpeg(self.theme.jpeg_quality, &rgba, w, h, &mut jpeg)
+        {
             if let Some(eng) = &self.engine {
                 eng.push_frame(jpeg);
             }

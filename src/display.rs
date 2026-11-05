@@ -117,7 +117,9 @@ pub fn start(port_name: Option<String>, stop: Arc<AtomicBool>) -> EngineHandle {
         stats: stats.clone(),
         stop: stop.clone(),
     };
-    std::thread::spawn(move || engine_loop(port_name, slot, stats, stop));
+    std::thread::spawn(move || {
+        engine_loop(port_name, slot, stats, stop)
+    });
     handle
 }
 

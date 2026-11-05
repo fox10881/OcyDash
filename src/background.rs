@@ -31,10 +31,8 @@ fn ffmpeg_path() -> PathBuf {
 }
 /// cap video ring buffer
 const VIDEO_RING: usize = 8;
-/// cap total decoded GIF bytes (~64MB) — only for small predecoded GIFs
-const GIF_MAX_BYTES: usize = 64 * 1024 * 1024;
-/// GIFs larger than this stream through ffmpeg instead of predecoding
-const GIF_STREAM_BYTES: u64 = 3 * 1024 * 1024;
+/// cap total decoded GIF bytes — frames decimate to fit (~66 frames)
+const GIF_MAX_BYTES: usize = 80 * 1024 * 1024;
 
 pub enum Bg {
     Color([u8; 3]),
@@ -62,10 +60,19 @@ impl BgEngine {
         Self { w, h, src: None, err: None }
     }
 
-    /// Animated sources (predecoded GIF / ffmpeg video) need a render
-    /// each tick; Color/Static let the caller skip unchanged frames.
-    pub fn animated(&self) -> bool {
-        matches!(self.src, Some(Bg::Animated { .. } | Bg::Video { .. }))
+    /// Would the next `blit` produce NEW pixels? Animated → next frame's
+    /// delay has elapsed; Video → a decoded frame is queued; static
+    /// sources → never. Lets the render loop skip everything when the
+    /// bg frame itself hasn't advanced.
+    pub fn advance_pending(&self) -> bool {
+        match &self.src {
+            Some(Bg::Animated { frames, idx, last }) => {
+                !frames.is_empty()
+                    && last.elapsed().as_millis() as u32 >= frames[*idx].1.max(30)
+            }
+            Some(Bg::Video { ring, .. }) => !ring.lock().unwrap().is_empty(),
+            _ => false,
+        }
     }
 
     pub fn set(&mut self, cfg: &Background) {
@@ -74,26 +81,17 @@ impl BgEngine {
         self.src = Some(match cfg {
             Background::Color { color } => Bg::Color(*color),
             Background::Image { path } => {
-                // Large GIFs stream through the ffmpeg ring buffer like video
-                // (~8 frames ≈ 10MB) instead of predecoding every frame into
-                // RAM (up to 64MB). Small GIFs keep exact-delay predecode.
-                let is_gif = PathBuf::from(path)
-                    .extension()
-                    .map(|e| e.eq_ignore_ascii_case("gif"))
-                    .unwrap_or(false);
-                let big = std::fs::metadata(path)
-                    .map(|m| m.len() > GIF_STREAM_BYTES)
-                    .unwrap_or(false);
-                if is_gif && big {
-                    self.start_video(path, 15)
-                } else {
-                    match load_image(path, self.w, self.h) {
-                        Ok(frames) if frames.len() == 1 => Bg::Static { rgba: frames.into_iter().next().unwrap().0 },
-                        Ok(frames) => Bg::Animated { frames, idx: 0, last: Instant::now() },
-                        Err(e) => {
-                            self.err = Some(e);
-                            Bg::Color([10, 10, 16])
-                        }
+                // GIFs ALWAYS predecode into RAM — even huge ones. The
+                // panel's serial wire caps display at ~2.5fps anyway, so
+                // load_gif decimates to fit the byte cap (delays summed →
+                // playback speed preserved). This trades ~60MB RAM for a
+                // permanently idle ffmpeg (0% decode cpu) + memcpy blits.
+                match load_image(path, self.w, self.h) {
+                    Ok(frames) if frames.len() == 1 => Bg::Static { rgba: frames.into_iter().next().unwrap().0 },
+                    Ok(frames) => Bg::Animated { frames, idx: 0, last: Instant::now() },
+                    Err(e) => {
+                        self.err = Some(e);
+                        Bg::Color([10, 10, 16])
                     }
                 }
             },
@@ -151,6 +149,9 @@ impl BgEngine {
         let stop2 = stop.clone();
         let pool: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let pool2 = pool.clone();
+        // pace consumption at the output fps — ffmpeg blocks on the pipe
+        // once we stop draining, so its decode CPU collapses to ~idle
+        let frame_dur = Duration::from_millis(1000 / fps as u64);
         std::thread::spawn(move || {
             let frame_bytes = w * h * 4;
             loop {
@@ -173,6 +174,8 @@ impl BgEngine {
                             }
                         }
                         q.push_back(Arc::new(buf));
+                        drop(q);
+                        std::thread::sleep(frame_dur);
                     }
                     Err(_) => {
                         // ffmpeg ended (short clip w/ -stream_loop should loop;
@@ -206,10 +209,22 @@ impl BgEngine {
                 if frames.is_empty() {
                     return;
                 }
-                let (_, delay) = frames[*idx];
-                if last.elapsed().as_millis() as u32 >= delay.max(30) {
+                // advance as many frames as have fully elapsed — render
+                // ticks slower than the gif's delays skip frames instead
+                // of slowing the animation down
+                let mut el = last.elapsed().as_millis() as u32;
+                let mut advanced = false;
+                loop {
+                    let d = frames[*idx].1.max(30);
+                    if el < d {
+                        break;
+                    }
+                    el -= d;
                     *idx = (*idx + 1) % frames.len();
-                    *last = Instant::now();
+                    advanced = true;
+                }
+                if advanced {
+                    *last = Instant::now() - Duration::from_millis(el as u64);
                 }
                 let (rgba, _) = &frames[*idx];
                 if rgba.len() == out.len() {
@@ -261,8 +276,15 @@ fn load_image(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, Str
 }
 
 fn load_gif(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-    let dec = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file))
+    let bytes = std::fs::read(path).map_err(|e| format!("open {path}: {e}"))?;
+    // estimated frame count = Graphic Control Extension blocks (one per
+    // image frame) → uniform decimation stride to fit the RAM cap. Every
+    // frame still decodes (GIF frames are dependent) but only stride-th
+    // ones are kept; skipped delays fold into the previous kept frame.
+    let est_frames = bytes.windows(3).filter(|b| b == b"\x21\xF9\x04").count().max(1);
+    let cap_frames = (GIF_MAX_BYTES / (w * h * 4)).max(1);
+    let stride = est_frames.div_ceil(cap_frames).max(1);
+    let dec = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(std::io::Cursor::new(bytes)))
         .map_err(|e| format!("gif decode: {e}"))?;
     let frames = dec.into_frames().collect_frames().map_err(|e| format!("gif frames: {e}"))?;
     if frames.is_empty() {
@@ -272,7 +294,7 @@ fn load_gif(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, Strin
     let mut total = 0usize;
     // composite logical-screen frames so transparency accumulates correctly
     let mut canvas = vec![0u8; w * h * 4];
-    for f in frames {
+    for (i, f) in frames.into_iter().enumerate() {
         let delay = f.delay().numer_denom_ms();
         let delay_ms = delay.0 / delay.1.max(1);
         let img = image::DynamicImage::ImageRgba8(f.into_buffer());
@@ -290,11 +312,27 @@ fn load_gif(path: &str, w: usize, h: usize) -> Result<Vec<(Vec<u8>, u32)>, Strin
                 dst[3] = 255;
             }
         }
-        total += canvas.len();
-        if total > GIF_MAX_BYTES && !out.is_empty() {
-            break; // drop extra frames rather than balloon RAM
+        if i % stride == 0 {
+            total += canvas.len();
+            out.push((canvas.clone(), delay_ms));
+        } else if let Some(last) = out.last_mut() {
+            // skipped frame's delay accrues to the kept frame → timing stays exact
+            last.1 = last.1.saturating_add(delay_ms);
         }
-        out.push((canvas.clone(), delay_ms));
+        // safety net if the estimate under-counted: thin kept frames
+        // (drop every 2nd, fold delays) rather than blow the RAM budget
+        while total > GIF_MAX_BYTES && out.len() > 1 {
+            let mut thinned: Vec<(Vec<u8>, u32)> = Vec::with_capacity(out.len() / 2 + 1);
+            let mut it = out.into_iter();
+            while let Some((px0, d0)) = it.next() {
+                match it.next() {
+                    Some((_px1, d1)) => thinned.push((px0, d0.saturating_add(d1))),
+                    None => thinned.push((px0, d0)),
+                }
+            }
+            out = thinned;
+            total = out.iter().map(|(p, _)| p.len()).sum();
+        }
     }
     if out.is_empty() {
         Err("gif: empty".into())

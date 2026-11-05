@@ -84,6 +84,94 @@ fn main() {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        if only_type == 99 {
+            // timing mode: how expensive is one full tick's worth of calls?
+            let t0 = std::time::Instant::now();
+            let mut hits = 0u32;
+            for _ in 0..20 {
+                for i in 0..n.min(30) {
+                    read(i);
+                    for ty in 1u32..=8 {
+                        for idx in 0..128 {
+                            let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
+                            if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void)
+                                && r.is_valid != 0
+                            {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let ms = t0.elapsed().as_millis();
+            println!("20 sweeps x {hits} readings: {ms}ms total, {:.1}ms/sweep", ms as f64 / 20.0);
+            return;
+        }
+        if only_type == 97 {
+            // separate the cost: ReadDataFromSensor vs GetSensorValue
+            let t0 = std::time::Instant::now();
+            for _ in 0..50 {
+                for i in 0..n.min(30) {
+                    read(i);
+                }
+            }
+            let rd = t0.elapsed().as_millis() as f64 / 50.0;
+            let mut hits = 0;
+            let t1 = std::time::Instant::now();
+            for _ in 0..50 {
+                for i in 0..6 {
+                    for ty in 1u32..=8 {
+                        for idx in 0..20 {
+                            let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
+                            if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void)
+                                && r.is_valid != 0
+                            {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let vs = t1.elapsed().as_millis() as f64 / 50.0;
+            println!("read-all-sensors: {rd:.1}ms | 6x8x20 value probes ({hits} hits): {vs:.1}ms");
+            return;
+        }
+        if only_type == 98 {
+            // time ONLY valid slots — the production collect pattern
+            let mut valid: Vec<(i32, u32, i32)> = Vec::new();
+            let mut sensors = Vec::new();
+            for i in 0..n.min(30) {
+                read(i);
+                let mut any = false;
+                for ty in 1u32..=8 {
+                    for idx in 0..128 {
+                        let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
+                        if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0 {
+                            valid.push((i, ty, idx));
+                            any = true;
+                        }
+                    }
+                }
+                if any { sensors.push(i); }
+            }
+            println!("{} valid slots on {} sensors", valid.len(), sensors.len());
+            for rounds in [50usize] {
+                let t0 = std::time::Instant::now();
+                let mut hits = 0;
+                for _ in 0..rounds {
+                    for &s in &sensors { read(s); }
+                    for &(i, ty, idx) in &valid {
+                        let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
+                        if value_fn(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0 {
+                            hits += 1;
+                        }
+                    }
+                }
+                let ms = t0.elapsed().as_millis() as f64;
+                println!("{rounds} collects x {hits} reads: {ms:.0}ms total = {:.2}ms/collect", ms / rounds as f64);
+            }
+            return;
+        }
         for i in 0..n.min(30) {
             read(i);
             for ty in 1u32..=8 {

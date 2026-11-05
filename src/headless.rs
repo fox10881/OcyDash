@@ -10,9 +10,9 @@
 
 use crate::background::BgEngine;
 use crate::display;
-use crate::render::{rotate_rgba, Renderer};
+use crate::render::{rotate_rgba_into, Renderer};
 use crate::sensors;
-use crate::theme::{last_theme_path, themes_dir, Background, Theme, WidgetKind};
+use crate::theme::{last_theme_path, themes_dir, Theme};
 use chrono::Timelike;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -59,10 +59,15 @@ pub fn run_headless(port: Option<String>) -> i32 {
     // cache the sample — clone only when the feed publishes a new one
     let mut last_feed_gen = 0u64;
     let mut sample = feed.latest();
-    // render only when something changed (static bg + no clock = ~1/s)
-    let mut rendered_gen: Option<u64> = None;
-    let mut rendered_clock = 0u64;
     let mut theme_dirty = true;
+    // RAM-for-CPU steady state: the static base layer (bg + fixed widgets)
+    // is rendered once into renderer.base_px; each frame then costs a
+    // memcpy + the few dynamic strings — and when the dynamic signature
+    // is byte-identical we skip draw/rotate/encode entirely (~0% CPU).
+    let mut base_dirty = true;
+    let mut last_sig = 0u64;
+    let mut rot_buf: Vec<u8> = Vec::new();
+    let mut jpeg_buf: Vec<u8> = Vec::with_capacity(crate::protocol::JPEG_MAX_KB * 1024);
 
     'outer: loop {
         // tray-icon's win32 backend delivers events through the creating
@@ -122,20 +127,46 @@ pub fn run_headless(port: Option<String>) -> i32 {
             sample = feed.latest(); // Arc lists → clone is refcount bumps
         }
 
-        // render + stream — skipped entirely when nothing could have
-        // changed: static bg, no new sample, no clock second rollover
+        // Dynamic signature — hash of every dynamic widget's text, bar
+        // fraction and box. If byte-identical to the last rendered frame,
+        // the pixels CANNOT have changed (bg + statics are cached in the
+        // base layer) → skip draw + rotate + JPEG encode entirely.
         let now = now_secs();
-        let clock_sec = now as u64;
-        let has_clock = theme
-            .widgets
-            .iter()
-            .any(|w| w.visible && matches!(w.kind, WidgetKind::Clock));
-        if theme_dirty
-            || bg.animated()
-            || Some(fgen) != rendered_gen
-            || (has_clock && clock_sec != rendered_clock)
-        {
-            for (id, bw, bh) in renderer.draw(&theme, &mut bg, &sample, now) {
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut sig = std::collections::hash_map::DefaultHasher::new();
+            for w in &theme.widgets {
+                if !w.visible || w.is_static() {
+                    continue;
+                }
+                (w.x.to_bits(), w.y.to_bits(), w.w.to_bits(), w.h.to_bits(), w.bar)
+                    .hash(&mut sig);
+                w.text(&sample, now).hash(&mut sig);
+                if let Some(f) = w.bar_percent(&sample) {
+                    f.to_bits().hash(&mut sig);
+                }
+            }
+            theme.rotation.hash(&mut sig);
+            sig.finish()
+        };
+
+        // a NEW bg frame is due (GIF delay elapsed / video frame queued) —
+        // checked BEFORE any blit so the draw sees the advance
+        let bg_adv = bg.advance_pending();
+
+        if theme_dirty || base_dirty || bg_adv || sig != last_sig {
+            // layered draw for EVERY bg kind: rebuild_base composites the
+            // fresh bg frame + static widgets once; dynamic layer always
+            // draws on top. Animated bg frames only arrive at their own
+            // cadence, so between frames this is a memcpy + few strings.
+            let grows = renderer.draw_layered(
+                &theme,
+                &mut bg,
+                &sample,
+                now,
+                theme_dirty || base_dirty || bg_adv,
+            );
+            for (id, bw, bh) in grows {
                 if let Some(w) = theme.widgets.iter_mut().find(|x| x.id == id) {
                     if bw > w.w {
                         w.w = bw;
@@ -145,18 +176,28 @@ pub fn run_headless(port: Option<String>) -> i32 {
                     }
                 }
             }
-            let (rgba, w, h) =
-                rotate_rgba(&renderer.px, renderer.w, renderer.h, theme.rotation);
-            let jpeg = renderer.encode_jpeg(theme.jpeg_quality, &rgba, w, h);
-            if !jpeg.is_empty() {
-                engine.push_frame(jpeg);
+            // rotate into a reused buffer; rotation==0 encodes px directly
+            let (ew, eh, rbuf): (usize, usize, &[u8]) = if theme.rotation == 0 {
+                (renderer.w, renderer.h, &renderer.px)
+            } else {
+                let (w2, h2) = rotate_rgba_into(
+                    &renderer.px,
+                    renderer.w,
+                    renderer.h,
+                    theme.rotation,
+                    &mut rot_buf,
+                );
+                (w2, h2, &rot_buf)
+            };
+            if renderer.encode_jpeg(theme.jpeg_quality, rbuf, ew, eh, &mut jpeg_buf) {
+                engine.push_frame(jpeg_buf.clone());
             }
-            rendered_gen = Some(fgen);
-            rendered_clock = clock_sec;
+            base_dirty = false;
             theme_dirty = false;
+            last_sig = sig;
         }
 
-        std::thread::sleep(tick_for(&theme));
+        std::thread::sleep(tick_for(&bg));
     }
 
     // graceful: engine writes the clear sequence then closes the port
@@ -172,11 +213,18 @@ fn now_secs() -> f64 {
     t.num_seconds_from_midnight() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0
 }
 
-/// Render cadence — video bgs run at their fps, everything else ~15fps.
-fn tick_for(theme: &Theme) -> Duration {
-    match &theme.background {
-        Background::Video { fps, .. } => Duration::from_millis(1000 / (*fps as u64).clamp(1, 30)),
-        _ => Duration::from_millis(66),
+/// Render cadence — the loop only needs to wake often enough to catch
+/// bg-frame advances; advance_pending + the dynamic signature decide
+/// whether any work actually happens. Static themes tick at 2Hz (sensor
+/// samples land ~1/s anyway → ~0% CPU idle).
+fn tick_for(bg: &crate::background::BgEngine) -> Duration {
+    match &bg.src {
+        // animated bgs capped at ~4fps — the serial wire (2Mbaud) can't
+        // push an 80KB JPEG faster than ~2.5fps anyway, so anything above
+        // ~4fps renders frames the panel can never display
+        Some(crate::background::Bg::Video { .. }) => Duration::from_millis(300),
+        Some(crate::background::Bg::Animated { .. }) => Duration::from_millis(300),
+        _ => Duration::from_millis(500),
     }
 }
 

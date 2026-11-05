@@ -38,6 +38,9 @@ pub struct Renderer {
     font_system: FontSystem,
     swash: SwashCache,
     pub px: Vec<u8>,
+    /// cached base composite — bg + static widgets — so steady-state
+    /// frames memcpy this instead of re-shaping every label (~RAM for CPU)
+    base_px: Vec<u8>,
 }
 
 /// Build the font system from a CURATED font list instead of the whole
@@ -85,6 +88,7 @@ impl Renderer {
             font_system: build_font_system(),
             swash: SwashCache::new(),
             px: vec![0; w * h * 4],
+            base_px: vec![0; w * h * 4],
         }
     }
 
@@ -92,6 +96,7 @@ impl Renderer {
         self.w = w;
         self.h = h;
         self.px = vec![0; w * h * 4];
+        self.base_px = vec![0; w * h * 4];
     }
 
     /// Shape `txt` at `px` and compute real ink bounds + glyph placements.
@@ -373,13 +378,30 @@ impl Renderer {
         s: &SysSample,
         now_secs: f64,
     ) -> Vec<(u32, f32, f32)> {
+        bg.blit(&mut self.px);
+        self.draw_widgets(theme, s, now_secs, None)
+    }
+
+    /// Draw only the widgets matching `want_static` into `self.px`
+    /// (None = all widgets — the single-pass path).
+    fn draw_widgets(
+        &mut self,
+        theme: &Theme,
+        s: &SysSample,
+        now_secs: f64,
+        want_static: Option<bool>,
+    ) -> Vec<(u32, f32, f32)> {
         const PAD_X: f32 = 16.0;
         const PAD_Y: f32 = 10.0;
         let mut grows = Vec::new();
-        bg.blit(&mut self.px);
         for w in &theme.widgets {
             if !w.visible {
                 continue;
+            }
+            if let Some(st) = want_static {
+                if w.is_static() != st {
+                    continue;
+                }
             }
             // progress-bar mode: box strictly defines bar dimensions
             if w.bar {
@@ -417,12 +439,47 @@ impl Renderer {
         grows
     }
 
-    /// Encode px buffer as JPEG, auto-dropping quality under the cap.
-    pub fn encode_jpeg(&self, quality: u8, buf: &[u8], w: usize, h: usize) -> Vec<u8> {
+    /// Layered compose for the headless loop: `base_px` holds bg + static
+    /// widgets (rebuilt only when `rebuild_base`); each frame is a memcpy
+    /// of base + dynamic widgets only. For animated bgs `rebuild_base` is
+    /// true exactly on ticks where a new media frame lands.
+    pub fn draw_layered(
+        &mut self,
+        theme: &Theme,
+        bg: &mut BgEngine,
+        s: &SysSample,
+        now_secs: f64,
+        rebuild_base: bool,
+    ) -> Vec<(u32, f32, f32)> {
+        let mut grows = Vec::new();
+        if rebuild_base {
+            // draw the static composite INTO base_px via a swap — all the
+            // blit/layout helpers write to self.px
+            std::mem::swap(&mut self.px, &mut self.base_px);
+            bg.blit(&mut self.px);
+            grows.extend(self.draw_widgets(theme, s, now_secs, Some(true)));
+            std::mem::swap(&mut self.px, &mut self.base_px);
+        }
+        self.px.copy_from_slice(&self.base_px);
+        grows.extend(self.draw_widgets(theme, s, now_secs, Some(false)));
+        grows
+    }
+
+    /// Encode px buffer as JPEG into `out` (caller-owned, reused across
+    /// frames — no per-frame alloc). Auto-drops quality under the cap.
+    /// Returns false when encoding failed entirely.
+    pub fn encode_jpeg(
+        &self,
+        quality: u8,
+        buf: &[u8],
+        w: usize,
+        h: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
         let mut q = quality;
         loop {
-            let mut out = Vec::with_capacity(JPEG_MAX_KB * 1024);
-            let enc = Encoder::new(&mut out, q);
+            out.clear();
+            let enc = Encoder::new(&mut *out, q);
             if enc
                 .encode(buf, w as u16, h as u16, ColorType::Rgba)
                 .is_err()
@@ -430,11 +487,62 @@ impl Renderer {
                 break;
             }
             if out.len() <= JPEG_MAX_KB * 1024 || q <= 40 {
-                return out;
+                return true;
             }
             q = q.saturating_sub(5).max(40);
         }
-        Vec::new()
+        false
+    }
+}
+
+/// Rotate an RGBA buffer CW into `out` (reused across frames — no
+/// per-frame alloc). Returns the destination dims.
+pub fn rotate_rgba_into(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    deg: u16,
+    out: &mut Vec<u8>,
+) -> (usize, usize) {
+    match deg {
+        0 => {
+            out.clear();
+            out.extend_from_slice(src);
+            (sw, sh)
+        }
+        180 => {
+            out.resize(sw * sh * 4, 0);
+            for y in 0..sh {
+                for x in 0..sw {
+                    let si = (y * sw + x) * 4;
+                    let di = ((sh - 1 - y) * sw + (sw - 1 - x)) * 4;
+                    out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                }
+            }
+            (sw, sh)
+        }
+        90 | 270 => {
+            let (dw, dh) = (sh, sw);
+            out.resize(sw * sh * 4, 0);
+            for y in 0..dh {
+                for x in 0..dw {
+                    let (sx, sy) = if deg == 90 {
+                        (y, sh - 1 - x)
+                    } else {
+                        (sw - 1 - y, x)
+                    };
+                    let si = (sy * sw + sx) * 4;
+                    let di = (y * dw + x) * 4;
+                    out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                }
+            }
+            (dw, dh)
+        }
+        _ => {
+            out.clear();
+            out.extend_from_slice(src);
+            (sw, sh)
+        }
     }
 }
 

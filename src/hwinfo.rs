@@ -90,7 +90,16 @@ struct Slot {
     sensor: i32,
     ty: u32,
     idx: i32,
+    /// hot slots drive the auto-picked display fields — collected every
+    /// tick. Cold slots (override dropdowns, secondary rails) refresh
+    /// every FULL_EVERY ticks; their last values are re-emitted between
+    /// reads. Each driver call is ~0.37ms, so this is where CPU lives.
+    hot: bool,
 }
+
+/// Cold slots refresh every Nth collect — their values feed manual
+/// widget overrides where a ~10s lag is invisible.
+const FULL_EVERY: u64 = 60;
 
 pub struct Hwinfo {
     _lib: isize, // keep the module loaded (never DeInit — see probe notes)
@@ -98,12 +107,66 @@ pub struct Hwinfo {
     read: ReadFn,
     value: ValueFn,
     slots: Vec<Slot>,
-    sensors: Vec<i32>,
+    /// last emitted value per slot — cold slots re-emit cached values
+    /// between their scheduled reads
+    cache: Vec<Reading>,
+    /// sensors owning ≥1 hot slot — (sensor, refresh_interval). Each
+    /// ReadDataFromSensor is a REAL hardware poll (~6.5ms), so slow-moving
+    /// devices (mobo fans, memory, cooler) refresh every 3rd tick while
+    /// CPU/GPU stay every-tick. GetSensorValue itself is ~free.
+    hot_sensors: Vec<(i32, u64)>,
+    /// sensors owning ≥1 slot at all — ReadDataFromSensor on full ticks
+    all_sensors: Vec<i32>,
+    tick: u64,
 }
 
 fn cstr(b: &[u8]) -> String {
     let e = b.iter().position(|c| *c == 0).unwrap_or(b.len());
     String::from_utf8_lossy(&b[..e]).trim().to_string()
+}
+
+/// Discovery filter — keep only readings that map onto a SysSample list.
+/// C-states, VID rails, effective clocks, disk SMART and chipset misc are
+/// 90% of the sweep and never displayed; skipping them is the difference
+/// between ~4% and ~1% CPU on the sensor thread.
+fn keep(loc: u32, ty: u32, name: &str) -> bool {
+    match loc {
+        LOC_CPU => {
+            matches!(ty, TY_TEMP | TY_POWER | TY_USAGE | TY_FAN)
+                // C-state residencies + per-thread Utility duplicates —
+                // the utilization list only needs the real usage entries
+                && !name.contains("Residency")
+        }
+        LOC_GPU => matches!(ty, TY_TEMP | TY_FAN | TY_POWER | TY_USAGE),
+        LOC_MOBO => matches!(ty, TY_TEMP | TY_FAN),
+        LOC_COOLER => ty == TY_FAN,
+        LOC_SYSTEM => ty == TY_OTHER && name.starts_with("Physical Memory"),
+        _ => false,
+    }
+}
+
+/// Hot slots = the fields extract()/pick() auto-selects for the panel —
+/// collected every tick. Everything else is cold (~10s cadence).
+fn is_hot(loc: u32, name: &str) -> bool {
+    match loc {
+        LOC_CPU => {
+            name.contains("Tctl/Tdie")
+                || name.contains("Die (average)")
+                || name.contains("CCD1")
+                || name.contains("Total CPU Usage")
+                || name.contains("Package Power")
+        }
+        LOC_GPU => {
+            name == "GPU Temperature"
+                || name == "GPU Utilization"
+                || name == "GPU Power"
+                || name == "GPU Fan1"
+        }
+        LOC_MOBO => name == "CPU" || name == "System 2",
+        // cooler fans + the 3 memory readings surviving keep()
+        LOC_COOLER | LOC_SYSTEM => true,
+        _ => false,
+    }
 }
 
 impl Hwinfo {
@@ -150,29 +213,68 @@ impl Hwinfo {
             if n <= 0 {
                 return Err(format!("{n} sensors detected"));
             }
-            // discovery sweep — one pass, cached forever
+            // discovery sweep — one pass, cached forever. Filtered to the
+            // categories the UI actually renders (229 slots -> ~60): every
+            // kept slot is one driver round-trip per tick, so each dropped
+            // voltage rail / C-state / disk SMART entry is real CPU saved.
             let mut slots = Vec::new();
-            let mut sensors = Vec::new();
+            let mut cache = Vec::new();
+            let mut all_sensors = Vec::new();
             for i in 0..n.min(32) {
                 read(i);
                 let mut any = false;
                 for ty in [TY_TEMP, TY_FAN, TY_POWER, TY_USAGE, TY_OTHER] {
                     for idx in 0..128 {
                         let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
-                        if value(ty, i, idx, &mut r as *mut _ as *mut c_void) && r.is_valid != 0 {
-                            slots.push(Slot { sensor: i, ty, idx });
-                            any = true;
+                        if !(value(ty, i, idx, &mut r as *mut _ as *mut c_void)
+                            && r.is_valid != 0)
+                        {
+                            continue;
                         }
+                        let name = cstr(&r.rloc_name);
+                        if !keep(r.sensor_loc, ty, &name) {
+                            continue;
+                        }
+                        let hot = is_hot(r.sensor_loc, &name);
+                        slots.push(Slot { sensor: i, ty, idx, hot });
+                        cache.push(Reading {
+                            loc: r.sensor_loc,
+                            ty,
+                            subtype: r.rsubtype,
+                            sensor_name: cstr(&r.loc_name),
+                            name,
+                            value: r.value,
+                            units: cstr(&r.units),
+                        });
+                        any = true;
                     }
                 }
                 if any {
-                    sensors.push(i);
+                    all_sensors.push(i);
                 }
             }
+            // hot sensors + their refresh interval (1 = every tick)
+            let mut seen: std::collections::BTreeMap<i32, u64> = Default::default();
+            for (k, sl) in slots.iter().enumerate() {
+                if !sl.hot {
+                    continue;
+                }
+                let int = match cache[k].loc {
+                    // ~6.5ms per hardware poll — spread the cost. 2s CPU/GPU
+                    // updates still feel live on a cooler LCD; slow sensors
+                    // (mobo fans / memory / cooler) drift on 4s.
+                    LOC_CPU | LOC_GPU => 2,
+                    _ => 4,
+                };
+                seen.entry(sl.sensor).or_insert(int);
+            }
+            let hot_sensors: Vec<(i32, u64)> = seen.into_iter().collect();
+            let hot_n = slots.iter().filter(|s| s.hot).count();
             crate::sensors::slog(&format!(
-                "hwinfo native: {} sensors, {} live slots ({})",
+                "hwinfo native: {} sensors, {} slots ({} hot) ({})",
                 n,
                 slots.len(),
+                hot_n,
                 path.display()
             ));
             Ok(Hwinfo {
@@ -181,25 +283,53 @@ impl Hwinfo {
                 read,
                 value,
                 slots,
-                sensors,
+                cache,
+                hot_sensors,
+                all_sensors,
+                tick: 0,
             })
         }
     }
 
-    /// Collect all cached readings — one ReadDataFromSensor per live
-    /// sensor, then GetSensorValue per known-good slot.
-    pub fn collect(&mut self) -> Vec<Reading> {
-        let mut out = Vec::with_capacity(self.slots.len());
+    /// Collect readings. Only `ReadDataFromSensor` costs (~6.5ms hardware
+    /// poll) — `GetSensorValue` on a just-read sensor is ~free, so every
+    /// tick refreshes ALL slots of every sensor polled this tick. Sensor
+    /// cadence: CPU/GPU every 2nd tick, mobo/memory/cooler every 4th,
+    /// everything (cold sensors) every FULL_EVERY-th. Manual overrides on
+    /// a polled sensor therefore stay ~2s-fresh; only never-polled cold
+    /// sensors lag.
+    pub fn collect(&mut self) -> &[Reading] {
+        self.tick += 1;
+        let full = self.tick % FULL_EVERY == 1;
+        let mut refreshed = [false; 32];
         unsafe {
-            for &s in &self.sensors {
-                (self.read)(s);
+            if full {
+                for &s in &self.all_sensors {
+                    (self.read)(s);
+                    if (s as usize) < refreshed.len() {
+                        refreshed[s as usize] = true;
+                    }
+                }
+            } else {
+                for &(s, int) in &self.hot_sensors {
+                    if self.tick % int == 0 {
+                        (self.read)(s);
+                        if (s as usize) < refreshed.len() {
+                            refreshed[s as usize] = true;
+                        }
+                    }
+                }
             }
-            for sl in &self.slots {
+            for k in 0..self.slots.len() {
+                let sl = self.slots[k];
+                if !full && !refreshed[sl.sensor as usize] {
+                    continue;
+                }
                 let mut r = MaybeUninit::<SensorReadResult>::zeroed().assume_init();
                 if (self.value)(sl.ty, sl.sensor, sl.idx, &mut r as *mut _ as *mut c_void)
                     && r.is_valid != 0
                 {
-                    out.push(Reading {
+                    self.cache[k] = Reading {
                         loc: r.sensor_loc,
                         ty: sl.ty,
                         subtype: r.rsubtype,
@@ -207,11 +337,11 @@ impl Hwinfo {
                         name: cstr(&r.rloc_name),
                         value: r.value,
                         units: cstr(&r.units),
-                    });
+                    };
                 }
             }
         }
-        out
+        &self.cache
     }
 }
 

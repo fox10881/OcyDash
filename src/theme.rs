@@ -272,6 +272,18 @@ impl Widget {
         )
     }
 
+    /// true when `text()` can never vary frame-to-frame — CustomText and
+    /// name widgets pinned by a text_override qualify. Everything that
+    /// reads the sensor sample or the clock stays dynamic (headless uses
+    /// this to split the scene into a cached static layer + live layer).
+    pub fn is_static(&self) -> bool {
+        match &self.kind {
+            WidgetKind::CustomText { .. } => true,
+            WidgetKind::CpuName | WidgetKind::GpuName => !self.text_override.is_empty(),
+            _ => false,
+        }
+    }
+
     /// Text rendered for a live sample (or a preview sample when editing).
     pub fn text(&self, s: &crate::sensors::SysSample, now_secs: f64) -> String {
         use crate::sensors::SensorCat::*;

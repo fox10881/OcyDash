@@ -477,7 +477,7 @@ impl SensorFeed {
         // native producer: refresh OUR bin ~1/s, then let the normal
         // parse path below publish it (identical for remote readers)
         if let Some(hw) = self.native.as_mut() {
-            if self.last_native_write.elapsed() >= Duration::from_millis(900) {
+            if self.last_native_write.elapsed() >= Duration::from_millis(1400) {
                 self.last_native_write = Instant::now();
                 let rs = hw.collect();
                 if rs.is_empty() {
@@ -487,7 +487,7 @@ impl SensorFeed {
                     self.alive = false;
                     return None;
                 }
-                write_native_bin(&rs, &self.bin_path);
+                write_native_bin(rs, &self.bin_path);
             }
         }
         let raw = fs::read(&self.bin_path).ok();
@@ -617,7 +617,7 @@ pub fn start_feed(stop: Arc<AtomicBool>) -> SensorHandle {
                         *h.inner.lock().unwrap() = SysSample::default();
                         h.generation.fetch_add(1, Ordering::Relaxed);
                     }
-                    std::thread::sleep(Duration::from_millis(150));
+                    std::thread::sleep(Duration::from_millis(400));
                 }
             }
         }
