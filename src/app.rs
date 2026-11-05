@@ -684,14 +684,25 @@ impl EditorApp {
                         if w.bar {
                             ui.horizontal(|ui| {
                                 ui.label("fill");
-                                ch |= ui.color_edit_button_srgb(&mut w.bar_fill).changed();
+                                for (i, lbl) in ["<25%", "<50%", "<75%", "≥75%"].iter().enumerate()
+                                {
+                                    ui.vertical(|ui| {
+                                        ch |=
+                                            ui.color_edit_button_srgb(&mut w.bar_fill[i]).changed();
+                                        ui.small(*lbl);
+                                    });
+                                }
+                            });
+                            ui.horizontal(|ui| {
                                 ui.label("bg");
                                 ch |= ui.color_edit_button_srgb(&mut w.bar_bg).changed();
                                 ui.label("border");
                                 ch |= ui.color_edit_button_srgb(&mut w.bar_border).changed();
                             });
                             ch |= ui.checkbox(&mut w.bar_rounded, "rounded corners").changed();
-                            ui.small("box = exact bar dimensions");
+                            ui.small(
+                                "fill color follows the current value; box = exact bar dimensions",
+                            );
                         }
                     }
                 }

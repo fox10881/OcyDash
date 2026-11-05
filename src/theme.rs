@@ -176,8 +176,11 @@ pub struct Widget {
     pub bar: bool,
     #[serde(default = "df_bar_bg")]
     pub bar_bg: [u8; 3],
-    #[serde(default = "df_bar_fill")]
-    pub bar_fill: [u8; 3],
+    /// 4-tier fill: [0] <25%, [1] <50%, [2] <75%, [3] >=75%. Deserializer
+    /// accepts the OLD single `[r,g,b]` form and broadcasts it to all
+    /// tiers, so existing theme JSON keeps working.
+    #[serde(default = "df_bar_fills", deserialize_with = "de_bar_fill")]
+    pub bar_fill: [[u8; 3]; 4],
     #[serde(default = "df_bar_border")]
     pub bar_border: [u8; 3],
     #[serde(default = "df_true")]
@@ -200,8 +203,33 @@ fn df_true() -> bool {
 fn df_bar_bg() -> [u8; 3] {
     [18, 22, 30]
 }
-fn df_bar_fill() -> [u8; 3] {
-    [90, 200, 140]
+/// Escalating green → yellow → orange → red for the default bar tiers
+/// (tier 0 keeps the legacy single-fill green).
+fn df_bar_fills() -> [[u8; 3]; 4] {
+    [
+        [90, 200, 140],
+        [220, 200, 70],
+        [240, 140, 60],
+        [235, 70, 70],
+    ]
+}
+
+/// Accepts both `"bar_fill": [r,g,b]` (legacy single color) and
+/// `"bar_fill": [[r,g,b],[r,g,b],[r,g,b],[r,g,b]]` (tiered).
+fn de_bar_fill<'de, D>(d: D) -> Result<[[u8; 3]; 4], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        One([u8; 3]),
+        Four([[u8; 3]; 4]),
+    }
+    Ok(match Repr::deserialize(d)? {
+        Repr::One(c) => [c; 4],
+        Repr::Four(cs) => cs,
+    })
 }
 fn df_bar_border() -> [u8; 3] {
     [70, 76, 92]
@@ -236,7 +264,7 @@ impl Widget {
             text_override: String::new(),
             bar: false,
             bar_bg: df_bar_bg(),
-            bar_fill: df_bar_fill(),
+            bar_fill: df_bar_fills(),
             bar_border: df_bar_border(),
             bar_rounded: true,
             sensor_idx: 0,
@@ -261,6 +289,20 @@ impl Widget {
             return Some(0.0); // dead feed → empty bar, not a frozen fill
         }
         Some((v / 100.0).clamp(0.0, 1.0))
+    }
+
+    /// Tiered fill color for the current bar fraction.
+    pub fn bar_color(&self, frac: f64) -> [u8; 3] {
+        let i = if frac < 0.25 {
+            0
+        } else if frac < 0.5 {
+            1
+        } else if frac < 0.75 {
+            2
+        } else {
+            3
+        };
+        self.bar_fill[i]
     }
 
     /// whether this widget kind supports progress-bar mode
@@ -701,6 +743,28 @@ mod tests {
         assert!(themes_dir().join("x.json").exists());
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_single_bar_fill_broadcasts_to_all_tiers() {
+        // pre-tier themes stored "bar_fill":[r,g,b] — must not crash, and
+        // the single color fills all 4 slots
+        let mut v = serde_json::to_value(Widget::new(1, WidgetKind::CpuLoad)).unwrap();
+        v["bar_fill"] = serde_json::json!([10, 20, 30]);
+        let w: Widget = serde_json::from_value(v).unwrap();
+        assert_eq!(w.bar_fill, [[10, 20, 30]; 4]);
+        assert_eq!(w.bar_color(0.9), [10, 20, 30]);
+    }
+
+    #[test]
+    fn tiered_bar_fill_and_color_selection() {
+        let mut v = serde_json::to_value(Widget::new(1, WidgetKind::CpuLoad)).unwrap();
+        v["bar_fill"] = serde_json::json!([[1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4]]);
+        let w: Widget = serde_json::from_value(v).unwrap();
+        assert_eq!(w.bar_color(0.10), [1, 1, 1]);
+        assert_eq!(w.bar_color(0.49), [2, 2, 2]);
+        assert_eq!(w.bar_color(0.74), [3, 3, 3]);
+        assert_eq!(w.bar_color(1.00), [4, 4, 4]);
     }
 }
 

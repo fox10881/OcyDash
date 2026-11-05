@@ -337,6 +337,7 @@ impl Renderer {
 
     /// Progress bar widget: bar + centered % text.
     fn draw_bar(&mut self, w: &crate::theme::Widget, frac: f64, s: &SysSample, now: f64) {
+        let fill = w.bar_color(frac);
         self.draw_progress_bar(
             w.x as i32,
             w.y as i32,
@@ -345,7 +346,7 @@ impl Renderer {
             frac,
             Rgba(w.bar_border[0], w.bar_border[1], w.bar_border[2]),
             Rgba(w.bar_bg[0], w.bar_bg[1], w.bar_bg[2]),
-            Rgba(w.bar_fill[0], w.bar_fill[1], w.bar_fill[2]),
+            Rgba(fill[0], fill[1], fill[2]),
             w.bar_rounded,
         );
         // % text centered in the bar, capped to the bar height
