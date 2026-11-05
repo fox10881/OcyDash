@@ -13,7 +13,7 @@ Rust for the **Ocypus Sigma PRO L24 240MM AIO Liquid CPU Cooler**
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![RAM](https://img.shields.io/badge/RAM-~136%20MB-brightgreen)
+![RAM](https://img.shields.io/badge/RAM-~14%20MB-brightgreen)
 ![CPU](https://img.shields.io/badge/CPU-0%25-brightgreen)
 
 ---
@@ -27,24 +27,28 @@ native Rust — measured side-by-side in Task Manager:
 
 | | Official Software | **OcyDash (headless)** |
 |---|---|---|
-| RAM footprint | **~430+ MB** | **~136 MB** |
+| RAM (static background) | **~430+ MB** | **~14 MB** |
+| RAM (animated GIF) | **~430+ MB** | **~136 MB — fully pre-decoded** |
 | CPU (idle) | constant background churn | **absolute 0%** |
 | Animated backgrounds | + a ~98%-of-a-core ffmpeg child | **0% — predecoded, no ffmpeg at all** |
 | Background processes | multiple helpers | **one** service |
 
-OcyDash deliberately trades RAM for CPU: a **layer-caching + GIF
-pre-decoding pipeline** keeps everything expensive resident in memory so the
-steady-state loop is almost pure `memcpy` — the static widget layer is
-composited once, media frames are decoded once at load, JPEG buffers are
-reused, and the render gate only repaints when pixels would actually change.
-That stable ~136 MB buys you **0.00% CPU on the Task Manager counter** — a
->3× footprint win over the vendor bloatware *and* an idle processor.
+With a static image or solid color, OcyDash is an **ultra-lightweight ~14 MB**
+at an absolute 0% CPU — a ~30× footprint win over the vendor bloatware with
+an idle processor to match. Animated GIF themes are the *only* case where
+RAM climbs to ~136 MB, and that is a deliberate trade: the **layer-caching
++ GIF pre-decoding pipeline** decodes every frame once at load and keeps it
+resident, so playback stays at 0% CPU forever instead of paying decode cost
+on every frame — the steady-state loop is almost pure `memcpy`. The static
+widget layer is composited once, JPEG buffers are reused, and the render
+gate only repaints when pixels would actually change.
 
 It stays honest because OcyDash is built as a **dual-mode architecture**:
 
 - **Headless tray service** — the default mode. No GUI framework, no GPU
   context, no Chromium. It owns the serial port, streams frames to the LCD,
-  and keeps that flat ~136 MB / ~0% profile around the clock.
+  and keeps that ~14 MB (static) / ~136 MB (animated) flat profile at ~0%
+  CPU around the clock.
 - **On-demand GUI editor** — a separate process spawned only when you click
   *Open Editor*. Edit your theme, close the window, and every byte of GUI
   memory is freed while streaming continues uninterrupted.
