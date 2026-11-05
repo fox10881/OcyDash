@@ -38,7 +38,35 @@ raw big-endian RGB565 instead — L24 is NOT SPI (model = TXW818-NV3052C).
 
 ## Sensor feed
 
-Official app spawns `resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
+**Native HWiNFO FFI (current):** `src/hwinfo.rs` loads `HWiNFO64.dll`
+directly (ordinals 863=Init, 723=Count, 366=ReadDataFromSensor,
+840=GetSensorName, 906=GetSensorValue — signatures from the decompiled
+CPUIDSDK delegates). One discovery sweep caches ~229 valid
+(sensor,type,index) slots; each tick re-reads only those. The writer
+owner emits `OcypusRust.bin` in the SAME [u32 len][JSON] schema the
+vendor helper used — readers (editor when headless owns) adopt it
+unchanged. `SENSOR_READ_RESULT` is ~464 bytes (bool IsValid, double
+value, char[32] units, SENSOR_INFO with location enums + two char[128]
+names) — a smaller struct = heap corruption. Loc enums: 10=System
+(Physical Memory Used/Available/Load MB), 11=CPU (Tctl/Tdie idx0,
+Package Power, Total CPU Usage idx17), 12=MOBO (fans: "CPU" header =
+AIO, "System 2" = pump), 13=GPU (temp/power/fans/clock; NVIDIA 5070 Ti
+= discrete via `checked`), 15=disk, 22=cooler. NEVER call DeInit —
+it segfaults in probes; process exit reclaims the driver client.
+
+**Why native:** `SystemInfos.exe` (the .NET wrapper) silently deadlocks
+on this hardware — `HWInfo.Init(0)` fails, `WriteLog` is a no-op, and
+after 20 retries the worker `Thread.Sleep(-1)`s forever while a PARALLEL
+WMI task prints the misleading `[DEBUG] PCI\VEN_1002` lines (the stall
+is NOT in display enumeration). Survives reboot; the official exe hangs
+identically from its own directory. The DLL engine itself is fine —
+Init(0)=0, all sensors stream.
+
+**Helper fallback (dormant):** if `Hwinfo::init()` fails (missing DLL /
+driver), the writer falls back to spawning `SystemInfos.exe` per below.
+
+**Helper details (fallback path):** official app spawns
+`resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
 <name> <diskScanIntervalSeconds> <skipDisk>` (verified via .NET metadata:
 `get/set_DiskReadIntervalSeconds`, `SkipDiskSensor`,
 `HWi_FLAG_DRIVE_SCAN_DISABLE` — `1800` = 30-min disk rescan, `0` =

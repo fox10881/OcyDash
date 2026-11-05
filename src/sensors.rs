@@ -237,6 +237,15 @@ pub struct SensorFeed {
     /// logged "reader mode" once — avoids spamming sensors.log
     reader_logged: bool,
     child: Option<Child>,
+    /// native HWiNFO64.dll producer — replaces SystemInfos.exe entirely:
+    /// we write OcypusRust.bin ourselves and readers adopt it identically
+    native: Option<crate::hwinfo::Hwinfo>,
+    /// native init attempted once per process — failure falls back to
+    /// the helper path below (cleared if a live native feed dies later)
+    native_tried: bool,
+    /// ~1s cadence for native bin writes (systemTime changes every write
+    /// → hash changes → poll publishes through the normal path)
+    last_native_write: Instant,
 }
 
 impl SensorFeed {
@@ -256,6 +265,9 @@ impl SensorFeed {
             escalated: false,
             reader_logged: false,
             child: None,
+            native: None,
+            native_tried: false,
+            last_native_write: Instant::now(),
         }
     }
 
@@ -337,6 +349,28 @@ impl SensorFeed {
         // drop the stale bin so the fresh writer's first parse can't
         // flash dead values onto the panel
         let _ = fs::remove_file(bin_path(OUR_NAME));
+        // NATIVE FIRST — the vendor's .NET wrapper deadlocks inside its
+        // own init on this hardware (silent retry → Sleep(-1)), while
+        // calling HWiNFO64.dll ordinals directly works deterministically.
+        // One attempt per process; failure falls through to the helper.
+        if !self.native_tried {
+            self.native_tried = true;
+            match crate::hwinfo::Hwinfo::init() {
+                Ok(h) => {
+                    slog("native HWiNFO telemetry online — helper bypassed");
+                    self.native = Some(h);
+                    self.bin_path = bin_path(OUR_NAME);
+                    self.alive = true;
+                    self.seeded = true; // our own writes are fresh content
+                    // force the first bin write on the very next poll
+                    self.last_native_write = Instant::now() - Duration::from_secs(2);
+                    self.last_change = Instant::now();
+                    self.note_live();
+                    return;
+                }
+                Err(e) => slog(&format!("native hwinfo init failed ({e}) — helper fallback")),
+            }
+        }
         self.spawn();
         // repoint at our own bin — we may have adopted another writer earlier
         self.bin_path = bin_path(OUR_NAME);
@@ -440,6 +474,22 @@ impl SensorFeed {
 
     /// Poll the bin file; returns Some(sample) only when content changed.
     pub fn poll(&mut self) -> Option<SysSample> {
+        // native producer: refresh OUR bin ~1/s, then let the normal
+        // parse path below publish it (identical for remote readers)
+        if let Some(hw) = self.native.as_mut() {
+            if self.last_native_write.elapsed() >= Duration::from_millis(900) {
+                self.last_native_write = Instant::now();
+                let rs = hw.collect();
+                if rs.is_empty() {
+                    slog("native feed returned nothing — dropping, helper fallback");
+                    self.native = None;
+                    self.native_tried = false; // allow re-init next recovery
+                    self.alive = false;
+                    return None;
+                }
+                write_native_bin(&rs, &self.bin_path);
+            }
+        }
         let raw = fs::read(&self.bin_path).ok();
         let raw = match raw {
             Some(r) if r.len() >= 4 => r,
@@ -742,6 +792,122 @@ fn extract(b: &BinFile) -> SysSample {
         }
     }
     s
+}
+
+/// Serialize native readings into the EXACT JSON schema the vendor
+/// helper wrote, then emit `OcypusRust.bin` = [u32 LE len][utf8 json].
+/// Every OcyDash process (headless + editor) keeps parsing the same
+/// contract — only the producer changed.
+fn write_native_bin(rs: &[crate::hwinfo::Reading], path: &PathBuf) {
+    use crate::hwinfo as hw;
+    use serde_json::json;
+
+    let mut cpu_t = Vec::new();
+    let mut cpu_l = Vec::new();
+    let mut cpu_p = Vec::new();
+    let mut cpu_f = Vec::new();
+    let mut gpu_t = Vec::new();
+    let mut gpu_l = Vec::new();
+    let mut gpu_p = Vec::new();
+    let mut gpu_f = Vec::new();
+    let mut cpu_name = String::new();
+    let mut gpu_names: Vec<(bool, String)> = Vec::new(); // (discrete, name)
+    let mut mem_used = 0.0f64;
+    let mut mem_avail = 0.0f64;
+    let mut mem_load = 0.0f64;
+
+    // discrete GPU = name carrying a real board identity; the iGPU shows
+    // up as bare "AMD Radeon". Marks its entries `checked` so pick()
+    // prefers it — exactly what the helper's checked flags did.
+    let discrete = |n: &str| {
+        let l = n.to_lowercase();
+        l.contains("geforce") || l.contains("rtx") || l.contains("arc") || l.contains("radeon rx")
+    };
+
+    for r in rs {
+        let long = format!("{} : {}", r.sensor_name, r.name);
+        match (r.loc, r.ty) {
+            (hw::LOC_CPU, hw::TY_TEMP) => {
+                cpu_t.push(json!({"sensorname": r.name, "value": r.value, "checked": r.name.contains("Tctl/Tdie")}));
+            }
+            (hw::LOC_CPU, hw::TY_USAGE) => {
+                cpu_l.push(json!({"sensorname": r.name, "value": r.value, "checked": r.name.contains("Total CPU Usage")}));
+            }
+            (hw::LOC_CPU, hw::TY_POWER) => {
+                cpu_p.push(json!({"sensorname": r.name, "value": r.value, "checked": r.name.contains("Package")}));
+            }
+            (hw::LOC_CPU, hw::TY_FAN) => {
+                cpu_f.push(json!({"sensorname": long, "value": r.value, "checked": false}));
+            }
+            (hw::LOC_MOBO, hw::TY_FAN) | (hw::LOC_COOLER, hw::TY_FAN) => {
+                // "{mobo} : CPU" ends with ": CPU" → pick_fan's suffix match
+                cpu_f.push(json!({"sensorname": long, "value": r.value, "checked": false}));
+            }
+            (hw::LOC_MOBO, hw::TY_TEMP) => {
+                cpu_t.push(json!({"sensorname": long, "value": r.value, "checked": false}));
+            }
+            (hw::LOC_GPU, hw::TY_TEMP) => {
+                gpu_t.push(json!({"sensorname": long, "value": r.value, "checked": discrete(&r.sensor_name)}));
+            }
+            (hw::LOC_GPU, hw::TY_USAGE) => {
+                gpu_l.push(json!({"sensorname": long, "value": r.value, "checked": discrete(&r.sensor_name)}));
+            }
+            (hw::LOC_GPU, hw::TY_POWER) => {
+                gpu_p.push(json!({"sensorname": long, "value": r.value, "checked": discrete(&r.sensor_name)}));
+            }
+            (hw::LOC_GPU, hw::TY_FAN) => {
+                gpu_f.push(json!({"sensorname": long, "value": r.value, "checked": discrete(&r.sensor_name)}));
+            }
+            (hw::LOC_SYSTEM, hw::TY_OTHER) => match r.name.as_str() {
+                "Physical Memory Used" => mem_used = r.value / 1024.0,
+                "Physical Memory Available" => mem_avail = r.value / 1024.0,
+                "Physical Memory Load" => mem_load = r.value,
+                _ => {}
+            },
+            _ => {}
+        }
+        if r.loc == hw::LOC_CPU && cpu_name.is_empty() && !r.sensor_name.is_empty() {
+            cpu_name = r.sensor_name.clone();
+        }
+        if r.loc == hw::LOC_GPU && !gpu_names.iter().any(|(_, n)| n == &r.sensor_name) {
+            gpu_names.push((discrete(&r.sensor_name), r.sensor_name.clone()));
+        }
+    }
+    gpu_names.sort_by_key(|(d, _)| !*d); // discrete first → name_list.first()
+
+    let entry = |n: &str, v: f64| json!({"sensorname": n, "value": v, "checked": false});
+    let names = |v: Vec<String>| -> serde_json::Value {
+        json!(v.iter().map(|n| json!({"sensorname": n, "value": n, "checked": false})).collect::<Vec<_>>())
+    };
+    let body = json!({
+        "cpuLayout": {
+            "temperature_list": cpu_t,
+            "utilization_list": cpu_l,
+            "powerDraw_list": cpu_p,
+            "fanSpeed_list": cpu_f,
+            "name_list": names(vec![cpu_name]),
+        },
+        "graphics": {
+            "temperature_list": gpu_t,
+            "utilization_list": gpu_l,
+            "powerDraw_list": gpu_p,
+            "fanSpeed_list": gpu_f,
+            "name_list": names(gpu_names.into_iter().map(|(_, n)| n).collect()),
+        },
+        "memLayout": {
+            "used": mem_used,
+            "total": mem_used + mem_avail,
+            "free": mem_avail,
+            "utilization_list": [entry("Physical Memory Load", mem_load)],
+        },
+        // advancing timestamp — the aliveness heartbeat every reader keys on
+        "systemTime": chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
+    });
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bytes);
+    let _ = fs::write(path, out);
 }
 
 /// The interactive user's temp dir — forced onto spawned helpers via

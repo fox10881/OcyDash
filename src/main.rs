@@ -22,6 +22,7 @@ mod background;
 mod deps;
 mod display;
 mod headless;
+mod hwinfo;
 mod icon;
 mod job;
 mod protocol;
