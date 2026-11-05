@@ -11,28 +11,38 @@ Rust for the **Ocypus Sigma PRO L24 240MM AIO Liquid CPU Cooler**
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![RAM](https://img.shields.io/badge/RAM-~15%20MB-brightgreen)
+![RAM](https://img.shields.io/badge/RAM-~136%20MB-brightgreen)
+![CPU](https://img.shields.io/badge/CPU-0%25-brightgreen)
 
 ---
 
 ## Why OcyDash? (The Performance Leap)
 
 The stock monitoring app is an Electron wrapper that keeps a full Chromium
-browser alive 24/7 just to push a JPEG to a 640×480 panel. OcyDash does the
-same job in native Rust — measured side-by-side in Task Manager:
+browser alive 24/7 just to push a JPEG to a 640×480 panel — plus a sensor
+helper that can silently deadlock for good. OcyDash does the same job in
+native Rust — measured side-by-side in Task Manager:
 
 | | Official Software | **OcyDash (headless)** |
 |---|---|---|
-| RAM footprint | **~430+ MB** | **~15 MB** |
-| CPU (idle/static theme) | constant background churn | **~0%** |
+| RAM footprint | **~430+ MB** | **~136 MB** |
+| CPU (idle) | constant background churn | **absolute 0%** |
+| Animated backgrounds | + a ~98%-of-a-core ffmpeg child | **0% — predecoded, no ffmpeg at all** |
 | Background processes | multiple helpers | **one** service |
 
-That's a **~28× memory reduction** — and it stays that low forever, because
-OcyDash is built as a **dual-mode architecture**:
+OcyDash deliberately trades RAM for CPU: a **layer-caching + GIF
+pre-decoding pipeline** keeps everything expensive resident in memory so the
+steady-state loop is almost pure `memcpy` — the static widget layer is
+composited once, media frames are decoded once at load, JPEG buffers are
+reused, and the render gate only repaints when pixels would actually change.
+That stable ~136 MB buys you **0.00% CPU on the Task Manager counter** — a
+>3× footprint win over the vendor bloatware *and* an idle processor.
+
+It stays honest because OcyDash is built as a **dual-mode architecture**:
 
 - **Headless tray service** — the default mode. No GUI framework, no GPU
   context, no Chromium. It owns the serial port, streams frames to the LCD,
-  and sips ~15 MB of RAM around the clock.
+  and keeps that flat ~136 MB / ~0% profile around the clock.
 - **On-demand GUI editor** — a separate process spawned only when you click
   *Open Editor*. Edit your theme, close the window, and every byte of GUI
   memory is freed while streaming continues uninterrupted.
@@ -44,11 +54,14 @@ OcyDash is built as a **dual-mode architecture**:
 - **Advanced GUI Editor** — drag-and-drop widgets on the real 640×480 canvas,
   8-way resize handles that scale the font, per-widget colors/alignment/
   decimals, and full theme customization.
-- **Rich Hardware Monitoring** — direct HWiNFO integration (memory-mapped
-  feed, no WMI polling). Choose exactly which sensor to track — CPU, GPU,
-  RAM, Fans, Power — with per-widget manual dropdown overrides.
-- **Dynamic Progress Bars** — custom-rendered, color-customizable progress
-  pills for CPU/GPU/RAM loads (fill, track, border, rounded corners).
+- **Rich Hardware Monitoring** — native HWiNFO telemetry via direct FFI
+  into `HWiNFO64.dll` (no WMI polling, no flaky .NET helper). Choose
+  exactly which sensor to track — CPU, GPU, RAM, Fans, Power — with
+  per-widget manual dropdown overrides.
+- **Dynamic Progress Bars** — custom-rendered progress pills for
+  CPU/GPU/RAM loads with **4-tier conditional fill colors**
+  (`<25%` / `<50%` / `<75%` / `≥75%`), plus track, border and rounded-corner
+  customization.
 - **Self-Contained Themes** — saving a theme automatically copies its
   background media (Images/GIFs/Videos) into the theme folder and cleans up
   orphans — share a folder, get a complete theme.
@@ -76,11 +89,11 @@ OcyDash is built as a **dual-mode architecture**:
    service at logon.
 
 > **Requirements:** Windows 10/11 x64, **administrator rights** — OcyDash
-> embeds a `requireAdministrator` manifest so it can orchestrate the
-> vendor's elevated `SystemInfos.exe` sensor helper without repeated UAC
-> prompts (one consent at launch; the startup task bypasses it at logon).
-> Keep the official package's SDK components installed for the HWiNFO feed,
-> or any `Ocypus*.bin` writer works.
+> embeds a `requireAdministrator` manifest because the HWiNFO sensor driver
+> is kernel-level (one consent at launch; the startup task bypasses it at
+> logon). Everything needed ships in the installer — the bundled
+> `HWiNFO64.dll` feeds sensors directly via native FFI, and the vendor's
+> `SystemInfos.exe` helper remains only as a dormant fallback.
 
 ## Build from Source
 

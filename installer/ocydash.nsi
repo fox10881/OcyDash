@@ -5,7 +5,7 @@
 Unicode true
 !define APP_NAME   "OcyDash"
 !define APP_EXE    "ocydash.exe"
-!define APP_VER    "0.1.0"
+!define APP_VER    "1.1.0"
 !define APP_DIR    "$PROGRAMFILES64\OcyDash"
 !define APP_UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\OcyDash"
 !define APP_RUNKEY "Software\Microsoft\Windows\CurrentVersion\Run"
