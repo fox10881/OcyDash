@@ -37,6 +37,12 @@ fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--editor" || a == "--edit") {
         return run_editor();
     }
+    // headless only: we're elevated here — kill older ocydash instances
+    // (they'd hold the single-instance mutex and a stale helper) plus
+    // helper-class processes parked on the single-client HWiNFO driver.
+    // The editor deliberately skips this — it must never kill the
+    // running headless service.
+    sensors::startup_cleanup();
     let code = headless::run_headless(parse_port_arg());
     if code != 0 {
         std::process::exit(code);

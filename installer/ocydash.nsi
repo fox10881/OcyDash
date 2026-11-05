@@ -41,8 +41,16 @@ Section "Install"
     SetShellVarContext all
     SetOutPath "$INSTDIR"
 
-    ; stop a running service/editor so files aren't locked
-    nsExec::ExecToStack 'taskkill /F /IM ${APP_EXE}'
+    ; stop a running service/editor so files aren't locked, and kill
+    ; helper-class processes parked on the single-client HWiNFO driver
+    ; (the fresh instance would otherwise stall writing zero bins)
+    nsExec::ExecToStack 'taskkill /F /T /IM ${APP_EXE}'
+    Pop $0
+    Pop $1
+    nsExec::ExecToStack 'taskkill /F /T /IM SystemInfos.exe'
+    Pop $0
+    Pop $1
+    nsExec::ExecToStack 'taskkill /F /T /IM SensorProbe.exe'
     Pop $0
     Pop $1
 
@@ -83,7 +91,10 @@ SectionEnd
 
 Section "Uninstall"
     SetShellVarContext all
-    nsExec::ExecToStack 'taskkill /F /IM ${APP_EXE}'
+    nsExec::ExecToStack 'taskkill /F /T /IM ${APP_EXE}'
+    Pop $0
+    Pop $1
+    nsExec::ExecToStack 'taskkill /F /T /IM SystemInfos.exe'
     Pop $0
     Pop $1
 

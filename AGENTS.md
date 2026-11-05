@@ -39,7 +39,10 @@ raw big-endian RGB565 instead — L24 is NOT SPI (model = TXW818-NV3052C).
 ## Sensor feed
 
 Official app spawns `resources/main/SDK/VC#/SystemInfos/.../SystemInfos.exe
-<name> <diskScanInterval> <disableDisk>`; helper writes
+<name> <diskScanIntervalSeconds> <skipDisk>` (verified via .NET metadata:
+`get/set_DiskReadIntervalSeconds`, `SkipDiskSensor`,
+`HWi_FLAG_DRIVE_SCAN_DISABLE` — `1800` = 30-min disk rescan, `0` =
+don't skip; NOT a lifetime, no self-terminate). Helper writes
 `%TEMP%\<name>.bin` = `u32 LE len + UTF-8 JSON` via **memory-mapped file**
 (content updates live, mtime frozen — never use mtime for freshness).
 `cpuLayout.temperature_list[]` → `CPU (Tctl/Tdie)`, `CPU Die (average)`,

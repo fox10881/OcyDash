@@ -215,6 +215,25 @@ pub struct SensorFeed {
     /// true when THIS process holds Local\OcyDashSensorWriter — only the
     /// holder may kill/spawn the shared helper (see claim_writer)
     writer: bool,
+    /// first-writer-claim purge already ran (kills helpers + wipes stale
+    /// bins) — once per process, then normal recovery takes over
+    purged: bool,
+    /// a valid bin parse already landed — the NEXT distinct content
+    /// proves a live writer and may publish. Guards the stale-bin flash:
+    /// a leftover OcypusRust.bin parses identically forever, and without
+    /// a baseline there's no way to tell it apart from a real writer
+    seeded: bool,
+    /// our spawned helper produced at least one successful parse —
+    /// a respawn chain of pure non-writers means a deeper wedge
+    /// (post-S3 driver state) and triggers the device-stack escalation
+    spawn_produced_write: bool,
+    /// consecutive spawns that never wrote a byte — at 2 we escalate:
+    /// restart GPU device stacks + the HWiNFO driver, then respawn
+    stall_strikes: u32,
+    /// escalation already ran for THIS dead period — re-armed when the
+    /// feed next goes live, so a kernel-wedged system doesn't get
+    /// hammered with device restarts every ~50s forever
+    escalated: bool,
     /// logged "reader mode" once — avoids spamming sensors.log
     reader_logged: bool,
     child: Option<Child>,
@@ -230,6 +249,11 @@ impl SensorFeed {
             last_spawn: None,
             alive: false,
             writer: false,
+            purged: false,
+            seeded: false,
+            spawn_produced_write: false,
+            stall_strikes: 0,
+            escalated: false,
             reader_logged: false,
             child: None,
         }
@@ -251,11 +275,22 @@ impl SensorFeed {
                 self.bin_path = p;
                 self.last_change = Instant::now();
                 self.alive = true;
+                // bin_alive() watched systemTime advance — content change
+                // already proven, so the next parse may publish directly
+                self.seeded = true;
+                self.note_live();
                 return;
             }
         }
         self.alive = false;
         self.recover();
+    }
+
+    /// Called whenever the feed proves live again — resets the stall
+    /// bookkeeping so a FUTURE dead period may escalate once more.
+    fn note_live(&mut self) {
+        self.stall_strikes = 0;
+        self.escalated = false;
     }
 
     /// Kill orphaned/zombie helpers holding a bin, then respawn ours —
@@ -272,6 +307,10 @@ impl SensorFeed {
         if self.in_spawn_grace() {
             return;
         }
+        // kill FIRST: a live client pins the driver service in
+        // STOP_PENDING, so the strike-count + escalation must come
+        // after the field is dead
+        let had_spawn = self.child.is_some();
         self.last_spawn = Some(Instant::now());
         slog("no live feed — killing stale helpers, respawning");
         if let Some(mut c) = self.child.take() {
@@ -282,6 +321,19 @@ impl SensorFeed {
         // HWiNFO driver — respawning into a still-held slot is what
         // parked every helper in GPU enumeration writing zero-bins
         std::thread::sleep(Duration::from_millis(1500));
+        // our last spawn produced zero bytes — the helper parked in
+        // enumeration (post-S3 device/driver wedge). Two strikes →
+        // escalate once: restart the GPU stacks + HWiNFO driver, then
+        // respawn into a reset field.
+        if had_spawn && !self.spawn_produced_write {
+            self.stall_strikes += 1;
+            if self.stall_strikes >= 2 && !self.escalated {
+                self.escalated = true;
+                self.stall_strikes = 0;
+                escalate_recovery();
+            }
+        }
+        self.spawn_produced_write = false;
         // drop the stale bin so the fresh writer's first parse can't
         // flash dead values onto the panel
         let _ = fs::remove_file(bin_path(OUR_NAME));
@@ -297,6 +349,10 @@ impl SensorFeed {
             self.writer = claim_writer();
             if self.writer {
                 slog("claimed sensor-writer role");
+                if !self.purged {
+                    self.purged = true;
+                    purge_field();
+                }
             } else if !self.reader_logged {
                 self.reader_logged = true;
                 slog("reader mode — another OcyDash process owns the helper");
@@ -335,6 +391,12 @@ impl SensorFeed {
             .current_dir(&dir)
             .env("TEMP", &temp)
             .env("TMP", &temp)
+            // the helper spams Console.WriteLine during PCI/GPU enum —
+            // with no console attached those writes must go to NUL or a
+            // full pipe buffer would deadlock it mid-enumeration
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             // SystemInfos.exe is console-subsystem — never show its window
             .creation_flags(
                 windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
@@ -361,6 +423,9 @@ impl SensorFeed {
                 );
                 match Command::new("powershell")
                     .args(["-NoProfile", "-Command", &ps])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .creation_flags(
                         windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
                     )
@@ -421,7 +486,9 @@ impl SensorFeed {
                 // letting a transient torn read look like a dead feed
                 self.last_hash = h;
                 self.last_change = Instant::now();
+                self.seeded = true; // content demonstrably changed
                 self.alive = true;
+                self.note_live();
                 // never spam: first failure only per feed
                 if self.last_sample.cpu_tctl == 0.0 {
                     slog(&format!("bin parse failed: {e}"));
@@ -431,7 +498,19 @@ impl SensorFeed {
         };
         self.last_hash = h;
         self.last_change = Instant::now();
+        if !self.seeded {
+            // first valid content we've ever seen — it could be a
+            // leftover bin from a dead session (parses identically
+            // forever). Don't publish until the bin CHANGES once —
+            // a live writer always produces a second distinct parse
+            // within ~2s, a stale file never does. (mtime can't be
+            // used: memory-mapped writes never touch it.)
+            self.seeded = true;
+            return None;
+        }
         self.alive = true;
+        self.spawn_produced_write = true;
+        self.note_live();
         self.last_sample = extract(&parsed);
         Some(self.last_sample.clone())
     }
@@ -681,7 +760,7 @@ fn bin_path(name: &str) -> PathBuf {
 /// Append a line to %APPDATA%\ocydash\sensors.log — the release build is
 /// windowless, so this file is the only way to see what the feed did in
 /// production (spawns, adoptions, recoveries, transitions).
-fn slog(msg: &str) {
+pub(crate) fn slog(msg: &str) {
     eprintln!("[sensors] {msg}");
     let Ok(ap) = std::env::var("APPDATA") else { return };
     let dir = PathBuf::from(ap).join("ocydash");
@@ -712,16 +791,130 @@ fn helper_path() -> Option<PathBuf> {
     })
 }
 
-/// Kill every SystemInfos.exe — any survivor is a stale writer or a
-/// zombie holding a bin file. Silent now that we run elevated
-/// (a non-admin taskkill can't touch the driver-protected process).
+/// Helper-class image names — anything that loads HWiNFO64.dll and
+/// parks on the single-client HWiNFO_214 driver slot. SensorProbe is
+/// our own debug binary; it still counts as a contender.
+const HELPER_IMAGES: [&str; 2] = ["SystemInfos.exe", "SensorProbe.exe"];
+
+/// Kill every helper-class process — any survivor is a stale writer or
+/// a zombie holding a bin file / the driver slot. `/T` reaps children.
+/// Silent now that we run elevated (a non-admin taskkill can't touch
+/// the driver-protected process).
 fn kill_helpers() {
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", HELPER_EXE])
+    for image in HELPER_IMAGES {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/IM", image])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// First-claim field wipe — runs ONCE when this process becomes the
+/// sensor writer. Kills every helper-class process (incl. leftovers a
+/// user shell couldn't touch) and deletes every stale `Ocypus*.bin` in
+/// all temp roots, so no dead file can ever be adopted or flash old
+/// numbers on the panel. The HWiNFO driver is single-client: an
+/// orphaned writer would park our fresh spawn in GPU enumeration
+/// writing a 64KB zero bin forever — clean field first.
+fn purge_field() {
+    slog("writer purge: killing helper-class processes, wiping stale bins");
+    kill_helpers();
+    // give killed helpers a beat to release the driver slot
+    std::thread::sleep(Duration::from_millis(1500));
+    for dir in temp_roots() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let stale = p
+                .file_name()
+                .map(|n| {
+                    let s = n.to_string_lossy();
+                    s.starts_with("Ocypus") && s.ends_with(".bin")
+                })
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// Two consecutive spawned helpers wrote nothing — the stall is below
+/// our process level (verified empirically: after an S3 resume the
+/// helper's GPU/monitor enumeration can deadlock in the kernel — the
+/// official binary hangs identically; `amduw23g` was seen failing to
+/// unload, the iGPU stuck Off Line, DISPLAY devices surprise-removed).
+/// Recovery attempt: restart every display-adapter device stack and the
+/// HWiNFO kernel driver, then let the normal respawn try once more on
+/// a reset field. Runs at most once per dead period. A deeper wedge
+/// (hung EC/kernel driver that ignores restarts) still ends at "---"
+/// until reboot — logged loudly so it's diagnosable.
+fn escalate_recovery() {
+    slog("STALL ESCALATION: restarting display adapters + HWiNFO driver");
+    // restart display adapters — wakes D3-stuck iGPUs and re-runs a
+    // wedged vendor driver stack (screen may flicker once)
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | \
+             ForEach-Object { pnputil /restart-device $_.InstanceId }",
+        ])
         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    // restart the HWiNFO kernel driver (service name is versioned —
+    // HWiNFO_214 etc. — so resolve it dynamically); a live client must
+    // be dead first or the service pins in STOP_PENDING
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_SystemDriver -Filter \"Name like 'HWiNFO%'\" \
+             | Where-Object {$_.State -eq 'Running'} | ForEach-Object { \
+             sc.exe stop $_.Name | Out-Null; Start-Sleep 3; \
+             sc.exe start $_.Name | Out-Null }",
+        ])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    slog("escalation done — respawning on reset field");
+}
+
+/// Elevated self-clean at headless startup — the app's own admin token
+/// can kill what the user's shell cannot: previous ocydash.exe
+/// instances (they hold the single-instance mutex AND their helper)
+/// plus orphaned helper-class processes parked on the single-client
+/// HWiNFO driver. Called from main() BEFORE run_headless so the fresh
+/// instance inherits a clean field without any user intervention.
+///
+/// Only OLDER ocydash instances are killed (StartTime strictly before
+/// ours) — a launch race can't make two fresh instances murder each
+/// other; equal timestamps fall through to the mutex.
+pub fn startup_cleanup() {
+    slog("startup cleanup: killing older ocydash + helper processes");
+    // older ocydash.exe instances — powershell for StartTime ordering
+    let me = std::process::id();
+    let ps = format!(
+        "$s=Get-Process -Id {me} -ErrorAction SilentlyContinue; \
+         Get-Process ocydash -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.Id -ne {me} -and $s -ne $null -and \
+         $_.StartTime -lt $s.StartTime }} | Stop-Process -Force"
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    kill_helpers();
 }
 
 /// Temp roots to scan — explicit user-profile paths come first because
