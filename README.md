@@ -1,5 +1,7 @@
-<img width="3834" height="1986" alt="Screenshot 2026-11-04 213950" src="https://github.com/user-attachments/assets/7a84a6a8-d05f-4cb6-b0e4-9f41c62b9db4" />
-<img width="1827" height="90" alt="Screenshot 2026-11-04 220021" src="https://github.com/user-attachments/assets/a28acaa7-1ba2-4b63-9b08-df1c6cb15f80" />
+<img width="3837" height="1977" alt="image" src="https://github.com/user-attachments/assets/881e0919-9427-444d-88c2-436f5b22a1d5" />
+
+<img width="1827" height="81" alt="Screenshot 2026-11-05 052022" src="https://github.com/user-attachments/assets/702adcdf-e088-45c8-93f4-c18297b31ecb" />
+
 
 
 # OcyDash: The Ultimate Custom Driver for Ocypus AIO Coolers
